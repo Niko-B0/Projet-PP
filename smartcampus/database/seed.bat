@@ -1,39 +1,74 @@
 @echo off
 setlocal
 
-set "MAMP_PHP_DIR=C:\MAMP\bin\php"
+set "PHP_EXE="
+set "PHP_SOURCE="
 
-if not exist "%MAMP_PHP_DIR%\" (
-    echo Erreur : MAMP est introuvable dans C:\MAMP\.
-    echo Installez MAMP dans C:\MAMP\ ou lancez database\seed.php avec un PHP qui contient pdo_mysql.
-    pause
-    exit /b 1
+where php.exe >nul 2>nul
+if not errorlevel 1 (
+    for /f "delims=" %%P in ('where php.exe 2^>nul') do (
+        set "PHP_EXE=%%P"
+        set "PHP_SOURCE=PATH"
+        goto :php_found
+    )
 )
 
-set "PHP_EXE="
+if exist "C:\MAMP\bin\php\" (
+    for /f "delims=" %%D in ('dir /b /ad /o-d "C:\MAMP\bin\php\php*" 2^>nul') do (
+        if exist "C:\MAMP\bin\php\%%D\php.exe" (
+            set "PHP_EXE=C:\MAMP\bin\php\%%D\php.exe"
+            set "PHP_SOURCE=MAMP"
+            goto :php_found
+        )
+    )
+)
 
-for /f "delims=" %%D in ('dir /b /ad /o-d "%MAMP_PHP_DIR%\php*" 2^>nul') do (
-    if exist "%MAMP_PHP_DIR%\%%D\php.exe" (
-        set "PHP_EXE=%MAMP_PHP_DIR%\%%D\php.exe"
+if exist "C:\xampp\php\php.exe" (
+    set "PHP_EXE=C:\xampp\php\php.exe"
+    set "PHP_SOURCE=XAMPP"
+    goto :php_found
+)
+
+if exist "C:\wamp64\bin\php\" (
+    for /f "delims=" %%P in ('dir /b /s /a-d "C:\wamp64\bin\php\php.exe" "C:\wamp64\bin\php\php*\php.exe" 2^>nul') do (
+        set "PHP_EXE=%%P"
+        set "PHP_SOURCE=WAMP"
+        goto :php_found
+    )
+)
+
+if exist "C:\laragon\bin\php\" (
+    for /f "delims=" %%P in ('dir /b /s /a-d "C:\laragon\bin\php\php.exe" "C:\laragon\bin\php\php*\php.exe" 2^>nul') do (
+        set "PHP_EXE=%%P"
+        set "PHP_SOURCE=LARAGON"
         goto :php_found
     )
 )
 
 :php_found
 if not defined PHP_EXE (
-    echo Erreur : aucun executable PHP MAMP trouve dans %MAMP_PHP_DIR%\php*\php.exe.
+    echo Erreur : aucun executable PHP n'a ete trouve.
+    echo Installez PHP ou utilisez MAMP, XAMPP, WAMP ou Laragon.
+    echo Vous pouvez aussi ajouter php.exe au PATH Windows.
     pause
     exit /b 1
 )
 
 set "SCRIPT_DIR=%~dp0"
-set "DB_HOST=127.0.0.1"
-set "DB_NAME=smartcampus"
-set "DB_USER=root"
-set "DB_PASS=root"
+if not defined DB_HOST set "DB_HOST=127.0.0.1"
+if not defined DB_NAME set "DB_NAME=smartcampus"
+if not defined DB_USER set "DB_USER=root"
+if not defined DB_PASS (
+    if "%PHP_SOURCE%"=="MAMP" (
+        set "DB_PASS=root"
+    ) else (
+        set "DB_PASS="
+    )
+)
 
-echo PHP utilise : %PHP_EXE%
+echo PHP utilise : %PHP_EXE% [%PHP_SOURCE%]
 echo Base cible : %DB_NAME% sur %DB_HOST%
+echo Utilisateur MySQL : %DB_USER%
 echo.
 
 "%PHP_EXE%" -r "exit(extension_loaded('pdo_mysql') ? 0 : 1);" >nul 2>nul
@@ -46,7 +81,8 @@ if errorlevel 1 (
 if errorlevel 1 (
     echo.
     echo Erreur : l'initialisation des donnees a echoue.
-    echo Verifiez que MySQL est demarre dans MAMP et que la base smartcampus existe.
+    echo Verifiez que MySQL est demarre, que la base smartcampus existe,
+    echo et que DB_USER / DB_PASS correspondent a votre serveur local.
     pause
     exit /b 1
 )

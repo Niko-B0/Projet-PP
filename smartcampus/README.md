@@ -15,7 +15,7 @@ SmartCampus est une application web pédagogique pour la gestion académique d�
 - MySQL
 - Node.js 18+
 - npm
-- MAMP ou XAMPP recommandé
+- Un serveur MySQL local : MAMP, XAMPP, WAMP, Laragon ou MySQL installé séparément
 
 ## Installation
 1. Ouvrir un terminal.
@@ -27,29 +27,42 @@ cd smartcampus
 ### Base de données
 1. Créez une base de données `smartcampus` dans MySQL.
 2. Importez le fichier SQL :
-```powershell
-& 'c:\MAMP\bin\mysql\bin\mysql.exe' -uroot -proot smartcampus < database/schema.sql
+```bash
+mysql -u root -p smartcampus < database/schema.sql
 ```
 3. Exécutez le script de données de test :
-```powershell
-$env:DB_USER = 'root'
-$env:DB_PASS = 'root'
-$env:DB_HOST = '127.0.0.1'
-$env:DB_NAME = 'smartcampus'
-& 'c:\MAMP\bin\php\php8.3.1\php.exe' database/seed.php
+```bash
+php database/seed.php
 ```
 
-Sous Windows avec MAMP, vous pouvez aussi double-cliquer sur `database\seed.bat`.
+Sous Windows, vous pouvez aussi double-cliquer sur `database\seed.bat`.
+Ce script cherche automatiquement PHP dans le PATH, MAMP, XAMPP, WAMP ou Laragon.
 
 > Si votre installation MySQL utilise d’autres identifiants, adaptez `DB_USER` et `DB_PASS`.
 
 ### Lancer le backend
+```bash
+php -S localhost:8000 -t backend/public
+```
+
+Si votre base MySQL n’utilise pas les identifiants par défaut, définissez les variables d’environnement avant de lancer le backend :
+
+PowerShell :
 ```powershell
-$env:DB_USER = 'root'
-$env:DB_PASS = 'root'
 $env:DB_HOST = '127.0.0.1'
 $env:DB_NAME = 'smartcampus'
-& 'c:\MAMP\bin\php\php8.3.1\php.exe' -S localhost:8000 -t backend/public
+$env:DB_USER = 'root'
+$env:DB_PASS = 'votre_mot_de_passe'
+php -S localhost:8000 -t backend/public
+```
+
+Invite de commandes Windows :
+```cmd
+set DB_HOST=127.0.0.1
+set DB_NAME=smartcampus
+set DB_USER=root
+set DB_PASS=votre_mot_de_passe
+php -S localhost:8000 -t backend\public
 ```
 
 ### Lancer le frontend
