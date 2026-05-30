@@ -96,6 +96,12 @@ npm run build
 - student.alice@smartcampus.local / password123
 - student.tom@smartcampus.local / password123
 
+## Scénario de démonstration
+Pour vérifier la règle de conflit d'emploi du temps, connectez-vous avec `student.alice@smartcampus.local`.
+Alice est déjà inscrite au cours `Intelligence Artificielle`, planifié le mardi de 10:00 à 12:00.
+Dans la page d'inscription aux cours, essayez de l'inscrire à `Cybersecurite`, également planifié le mardi de 10:00 à 12:00.
+L'API doit refuser l'inscription avec un message de conflit d'emploi du temps.
+
 ## Fonctionnalités développées
 - Authentification session PHP
 - Dashboards par rôle

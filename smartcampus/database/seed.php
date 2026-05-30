@@ -157,6 +157,9 @@ try {
     $course3 = addCourse($pdo, 'Base de données', 'Modélisation et SQL avec MySQL.', 25, 2, 'Informatique', 'Licence 2', 4, 1, $teacherId2);
     $course4 = addCourse($pdo, 'Analyse Numérique', 'Méthodes numériques et applications.', 20, 3, 'Mathématiques', 'Licence 3', 4, 1.1, $teacherId1);
     $course5 = addCourse($pdo, 'Réseaux', 'Architecture des réseaux et protocoles.', 28, 2, 'Informatique', 'Licence 2', 3, 0.9, $teacherId2);
+    $course6 = addCourse($pdo, 'Intelligence Artificielle', 'Introduction aux algorithmes d apprentissage et aux agents intelligents.', 24, 2, 'Informatique', 'Licence 2', 4, 1.1, $teacherId2);
+    $course7 = addCourse($pdo, 'Cybersecurite', 'Principes de securite, cryptographie et protection des systemes.', 24, 2, 'Informatique', 'Licence 2', 4, 1, $teacherId2);
+    $course8 = addCourse($pdo, 'Statistiques appliquees', 'Statistiques descriptives, probabilites et interpretation de donnees.', 22, 2, 'Mathématiques', 'Licence 2', 3, 0.9, $teacherId1);
 
     addSchedule($pdo, $course1, 'Lundi', '09:00', '11:00', 'Salle A1');
     addSchedule($pdo, $course1, 'Mercredi', '10:00', '12:00', 'Salle A1');
@@ -164,6 +167,9 @@ try {
     addSchedule($pdo, $course3, 'Jeudi', '14:00', '16:00', 'Salle C3');
     addSchedule($pdo, $course4, 'Vendredi', '10:00', '12:00', 'Salle D4');
     addSchedule($pdo, $course5, 'Mercredi', '14:00', '16:00', 'Salle B2');
+    addSchedule($pdo, $course6, 'Mardi', '10:00', '12:00', 'Salle E1');
+    addSchedule($pdo, $course7, 'Mardi', '10:00', '12:00', 'Salle F2');
+    addSchedule($pdo, $course8, 'Vendredi', '14:00', '16:00', 'Salle B4');
 
     $studentId1 = $pdo->query('SELECT id_student FROM students WHERE id_user = ' . $student1)->fetchColumn();
     $studentId2 = $pdo->query('SELECT id_student FROM students WHERE id_user = ' . $student2)->fetchColumn();
@@ -177,19 +183,32 @@ try {
     $enroll5 = addEnrollment($pdo, $studentId3, $course5);
     $enroll6 = addEnrollment($pdo, $studentId4, $course2);
     $enroll7 = addEnrollment($pdo, $studentId4, $course3);
+    $enroll8 = addEnrollment($pdo, $studentId1, $course6);
+    $enroll9 = addEnrollment($pdo, $studentId2, $course7);
+    $enroll10 = addEnrollment($pdo, $studentId3, $course8);
+    $enroll11 = addEnrollment($pdo, $studentId4, $course5);
 
     addGrade($pdo, $enroll1, $teacherId2, 14.5, 'Contrôle continu', 1);
     addGrade($pdo, $enroll2, $teacherId2, 12.0, 'Projet', 1.5);
     addGrade($pdo, $enroll3, $teacherId2, 16.0, 'Contrôle', 1);
     addGrade($pdo, $enroll4, $teacherId1, 11.5, 'Devoir', 1);
     addGrade($pdo, $enroll5, $teacherId2, 15.0, 'Partiel', 1.2);
+    addGrade($pdo, $enroll8, $teacherId2, 13.5, 'TP note', 1);
+    addGrade($pdo, $enroll9, $teacherId2, 17.0, 'Quiz securite', 1);
+    addGrade($pdo, $enroll10, $teacherId1, 12.5, 'Controle', 1);
 
     $slot1 = $pdo->query('SELECT id_slot FROM schedule_slots WHERE id_course = ' . $course1 . ' LIMIT 1')->fetchColumn();
     $slot2 = $pdo->query('SELECT id_slot FROM schedule_slots WHERE id_course = ' . $course2 . ' LIMIT 1')->fetchColumn();
+    $slot6 = $pdo->query('SELECT id_slot FROM schedule_slots WHERE id_course = ' . $course6 . ' LIMIT 1')->fetchColumn();
+    $slot7 = $pdo->query('SELECT id_slot FROM schedule_slots WHERE id_course = ' . $course7 . ' LIMIT 1')->fetchColumn();
+    $slot8 = $pdo->query('SELECT id_slot FROM schedule_slots WHERE id_course = ' . $course8 . ' LIMIT 1')->fetchColumn();
     addAttendance($pdo, $enroll1, $slot1, 'present');
     addAttendance($pdo, $enroll2, $slot1, 'absent');
     addAttendance($pdo, $enroll3, $slot1, 'justifie');
     addAttendance($pdo, $enroll4, $slot2, 'present');
+    addAttendance($pdo, $enroll8, $slot6, 'present');
+    addAttendance($pdo, $enroll9, $slot7, 'absent');
+    addAttendance($pdo, $enroll10, $slot8, 'justifie');
 
     $pdo->commit();
     echo "Données de test créées avec succès." . PHP_EOL;
