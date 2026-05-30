@@ -72,6 +72,23 @@ npm install
 npm run dev
 ```
 
+### Lancement simple sous Windows
+Pour une démonstration locale sans lancer deux serveurs :
+
+1. Démarrez MySQL dans MAMP, XAMPP, WAMP ou Laragon.
+2. Créez la base `smartcampus` et importez `database/schema.sql`.
+3. Double-cliquez sur `database\seed.bat` pour ajouter les données de test.
+4. Compilez le frontend une première fois :
+```bash
+cd frontend
+npm install
+npm run build
+```
+5. Revenez dans le dossier `smartcampus`, puis double-cliquez sur `start.bat`.
+6. Le site est accessible sur `http://localhost:8000`.
+
+`start.bat` cherche automatiquement PHP dans le PATH, MAMP, XAMPP, WAMP ou Laragon. Il sert le frontend compilé et l'API PHP avec le même serveur local.
+
 ## Comptes de test
 - admin@smartcampus.local / password123
 - teacher.dubois@smartcampus.local / password123

@@ -1,6 +1,11 @@
 @echo off
 setlocal
 
+if not defined DB_HOST set "DB_HOST=127.0.0.1"
+if not defined DB_NAME set "DB_NAME=smartcampus"
+if not defined DB_USER set "DB_USER=root"
+if not defined PORT set "PORT=8000"
+
 set "PHP_EXE="
 set "PHP_SOURCE="
 
@@ -45,19 +50,12 @@ if exist "C:\laragon\bin\php\" (
     )
 )
 
-:php_found
-if not defined PHP_EXE (
-    echo Erreur : aucun executable PHP n'a ete trouve.
-    echo Installez PHP ou utilisez MAMP, XAMPP, WAMP ou Laragon.
-    echo Vous pouvez aussi ajouter php.exe au PATH Windows.
-    pause
-    exit /b 1
-)
+echo Erreur : PHP introuvable. Installez PHP ou utilisez MAMP, XAMPP, WAMP ou Laragon.
+echo Vous pouvez aussi ajouter php.exe au PATH Windows.
+pause
+exit /b 1
 
-set "SCRIPT_DIR=%~dp0"
-if not defined DB_HOST set "DB_HOST=127.0.0.1"
-if not defined DB_NAME set "DB_NAME=smartcampus"
-if not defined DB_USER set "DB_USER=root"
+:php_found
 if not defined DB_PASS (
     if "%PHP_SOURCE%"=="MAMP" (
         set "DB_PASS=root"
@@ -66,34 +64,41 @@ if not defined DB_PASS (
     )
 )
 
-echo PHP utilise : %PHP_EXE% [%PHP_SOURCE%]
-echo Base cible : %DB_NAME% sur %DB_HOST%
-echo Utilisateur MySQL : %DB_USER%
-echo.
-
-for %%F in ("%PHP_EXE%") do set "PHP_DIR=%%~dpF"
-set "EXT_DIR=%PHP_DIR%ext"
-
-"%PHP_EXE%" -r "exit(extension_loaded('pdo_mysql') ? 0 : 1);" >nul 2>nul
-if errorlevel 1 (
-    if exist "%EXT_DIR%\php_pdo_mysql.dll" (
-        "%PHP_EXE%" -d extension_dir="%EXT_DIR%" -d extension=php_pdo_mysql "%SCRIPT_DIR%seed.php"
-    ) else (
-        "%PHP_EXE%" -d extension=php_pdo_mysql "%SCRIPT_DIR%seed.php"
-    )
-) else (
-    "%PHP_EXE%" "%SCRIPT_DIR%seed.php"
-)
-
-if errorlevel 1 (
-    echo.
-    echo Erreur : l'initialisation des donnees a echoue.
-    echo Verifiez que MySQL est demarre, que la base smartcampus existe,
-    echo et que DB_USER / DB_PASS correspondent a votre serveur local.
+if not exist "%~dp0frontend\dist\index.html" (
+    echo Erreur : le frontend n'est pas compile.
+    echo Lancez d'abord :
+    echo   cd frontend
+    echo   npm install
+    echo   npm run build
     pause
     exit /b 1
 )
 
+for %%F in ("%PHP_EXE%") do set "PHP_DIR=%%~dpF"
+set "EXT_DIR=%PHP_DIR%ext"
+
 echo.
-echo Donnees de test initialisees avec succes.
+echo SmartCampus - Demarrage
+echo ========================
+echo PHP     : %PHP_EXE% [%PHP_SOURCE%]
+echo Serveur : http://localhost:%PORT%
+echo Base    : %DB_NAME% sur %DB_HOST%
+echo User DB : %DB_USER%
+echo.
+
+start "" "http://localhost:%PORT%"
+echo Appuyez sur Ctrl+C pour arreter le serveur.
+echo.
+
+"%PHP_EXE%" -r "exit(extension_loaded('pdo_mysql') ? 0 : 1);" >nul 2>nul
+if errorlevel 1 (
+    if exist "%EXT_DIR%\php_pdo_mysql.dll" (
+        "%PHP_EXE%" -d extension_dir="%EXT_DIR%" -d extension=php_pdo_mysql -S localhost:%PORT% "%~dp0router.php"
+    ) else (
+        "%PHP_EXE%" -d extension=php_pdo_mysql -S localhost:%PORT% "%~dp0router.php"
+    )
+) else (
+    "%PHP_EXE%" -S localhost:%PORT% "%~dp0router.php"
+)
+
 pause
