@@ -80,14 +80,34 @@ class EtudiantController {
     }
 
     public static function update($id) {
-        requireAdmin();
+        requireAuthentication();
+        $current = currentSessionUser();
+        if ($current['role'] === 'student' && $current['id_student'] != $id) {
+            sendError('Acces interdit', 403);
+        }
+        if ($current['role'] !== 'student' && $current['role'] !== 'admin') {
+            sendError('Acces interdit', 403);
+        }
+
         $input = json_decode(file_get_contents('php://input'), true);
+        if (empty($input['email']) || empty($input['nom']) || empty($input['prenom'])) {
+            sendError('Champs obligatoires manquants', 400);
+        }
+        if (!filter_var($input['email'], FILTER_VALIDATE_EMAIL)) {
+            sendError('Email invalide', 400);
+        }
         $pdo = getDatabaseConnection();
         $stmt = $pdo->prepare('SELECT id_user FROM students WHERE id_student = :id_student');
         $stmt->execute(['id_student' => $id]);
         $student = $stmt->fetch();
         if (!$student) {
             sendError('Étudiant introuvable', 404);
+        }
+
+        $stmt = $pdo->prepare('SELECT id_user FROM users WHERE email = :email AND id_user <> :id_user');
+        $stmt->execute(['email' => $input['email'], 'id_user' => $student['id_user']]);
+        if ($stmt->fetch()) {
+            sendError('Cet email est deja utilise', 400);
         }
 
         $stmt = $pdo->prepare('UPDATE users SET nom = :nom, prenom = :prenom, email = :email, telephone = :telephone WHERE id_user = :id_user');

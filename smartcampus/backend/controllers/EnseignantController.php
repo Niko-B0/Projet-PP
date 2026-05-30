@@ -59,8 +59,22 @@ class EnseignantController {
     }
 
     public static function update($id) {
-        requireAdmin();
+        requireAuthentication();
+        $current = currentSessionUser();
+        if ($current['role'] === 'teacher' && $current['id_teacher'] != $id) {
+            sendError('Acces interdit', 403);
+        }
+        if ($current['role'] !== 'teacher' && $current['role'] !== 'admin') {
+            sendError('Acces interdit', 403);
+        }
+
         $input = json_decode(file_get_contents('php://input'), true);
+        if (empty($input['email']) || empty($input['nom']) || empty($input['prenom'])) {
+            sendError('Champs obligatoires manquants', 400);
+        }
+        if (!filter_var($input['email'], FILTER_VALIDATE_EMAIL)) {
+            sendError('Email invalide', 400);
+        }
         $pdo = getDatabaseConnection();
         $stmt = $pdo->prepare('SELECT id_user FROM teachers WHERE id_teacher = :id_teacher');
         $stmt->execute(['id_teacher' => $id]);
@@ -68,6 +82,12 @@ class EnseignantController {
         if (!$teacher) {
             sendError('Enseignant introuvable', 404);
         }
+        $stmt = $pdo->prepare('SELECT id_user FROM users WHERE email = :email AND id_user <> :id_user');
+        $stmt->execute(['email' => $input['email'], 'id_user' => $teacher['id_user']]);
+        if ($stmt->fetch()) {
+            sendError('Cet email est deja utilise', 400);
+        }
+
         $stmt = $pdo->prepare('UPDATE users SET nom = :nom, prenom = :prenom, email = :email, telephone = :telephone WHERE id_user = :id_user');
         $stmt->execute([
             'nom' => $input['nom'] ?? '',
