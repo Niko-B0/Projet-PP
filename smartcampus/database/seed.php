@@ -116,7 +116,7 @@ function addGrade(PDO $pdo, $id_enrollment, $id_teacher, $valeur, $type_evaluati
         return;
     }
     $stmt = $pdo->prepare('INSERT INTO grades (id_enrollment, id_teacher, valeur, type_evaluation, coef, date_note, locked) VALUES (:id_enrollment, :id_teacher, :valeur, :type_evaluation, :coef, CURDATE(), :locked)');
-    $stmt->execute(['id_enrollment' => $id_enrollment, 'id_teacher' => $id_teacher, 'valeur' => $valeur, 'type_evaluation' => $type_evaluation, 'coef' => $coef, 'locked' => $locked]);
+    $stmt->execute(['id_enrollment' => $id_enrollment, 'id_teacher' => $id_teacher, 'valeur' => $valeur, 'type_evaluation' => $type_evaluation, 'coef' => $coef, 'locked' => (int)$locked]);
 }
 
 function addAttendance(PDO $pdo, $id_enrollment, $id_slot, $statut) {

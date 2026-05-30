@@ -75,7 +75,7 @@ CREATE TABLE enrollments (
 CREATE TABLE grades (
   id_grade INT PRIMARY KEY AUTO_INCREMENT,
   id_enrollment INT NOT NULL,
-  id_teacher INT NOT NULL,
+  id_teacher INT NULL,
   valeur FLOAT NOT NULL,
   type_evaluation VARCHAR(100) DEFAULT '',
   coef FLOAT NOT NULL DEFAULT 1,

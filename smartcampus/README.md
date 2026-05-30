@@ -27,19 +27,27 @@ cd smartcampus
 ### Base de données
 1. Créez une base de données `smartcampus` dans MySQL.
 2. Importez le fichier SQL :
-```bash
-mysql -u root -p smartcampus < database/schema.sql
+```powershell
+& 'c:\MAMP\bin\mysql\bin\mysql.exe' -uroot -proot smartcampus < database/schema.sql
 ```
 3. Exécutez le script de données de test :
-```bash
-php database/seed.php
+```powershell
+$env:DB_USER = 'root'
+$env:DB_PASS = 'root'
+$env:DB_HOST = '127.0.0.1'
+$env:DB_NAME = 'smartcampus'
+& 'c:\MAMP\bin\php\php8.3.1\php.exe' database/seed.php
 ```
 
-> Si votre utilisateur MySQL a un mot de passe, adaptez la commande ou modifiez les variables d’environnement `DB_USER` et `DB_PASS`.
+> Si votre installation MySQL utilise d’autres identifiants, adaptez `DB_USER` et `DB_PASS`.
 
 ### Lancer le backend
-```bash
-php -S localhost:8000 -t backend/public
+```powershell
+$env:DB_USER = 'root'
+$env:DB_PASS = 'root'
+$env:DB_HOST = '127.0.0.1'
+$env:DB_NAME = 'smartcampus'
+& 'c:\MAMP\bin\php\php8.3.1\php.exe' -S localhost:8000 -t backend/public
 ```
 
 ### Lancer le frontend
