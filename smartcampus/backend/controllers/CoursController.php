@@ -75,7 +75,15 @@ class CoursController {
 
     public static function getStudents($id) {
         requireAuthentication();
+        $current = currentSessionUser();
         $pdo = getDatabaseConnection();
+        if ($current['role'] === 'teacher') {
+            $stmt = $pdo->prepare('SELECT id_course FROM courses WHERE id_course = :id_course AND id_teacher = :id_teacher');
+            $stmt->execute(['id_course' => $id, 'id_teacher' => $current['id_teacher']]);
+            if (!$stmt->fetch()) {
+                sendError('Acces interdit', 403);
+            }
+        }
         $stmt = $pdo->prepare('SELECT e.id_enrollment AS enrollment_id, s.id_student, u.nom, u.prenom, u.email, u.telephone FROM enrollments e JOIN students s ON e.id_student = s.id_student JOIN users u ON s.id_user = u.id_user WHERE e.id_course = :id_course');
         $stmt->execute(['id_course' => $id]);
         sendSuccess($stmt->fetchAll());
