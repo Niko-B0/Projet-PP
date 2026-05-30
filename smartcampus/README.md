@@ -39,6 +39,8 @@ $env:DB_NAME = 'smartcampus'
 & 'c:\MAMP\bin\php\php8.3.1\php.exe' database/seed.php
 ```
 
+Sous Windows avec MAMP, vous pouvez aussi double-cliquer sur `database\seed.bat`.
+
 > Si votre installation MySQL utilise d’autres identifiants, adaptez `DB_USER` et `DB_PASS`.
 
 ### Lancer le backend

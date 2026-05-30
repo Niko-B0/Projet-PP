@@ -101,8 +101,9 @@ function addSchedule(PDO $pdo, $id_course, $jour, $heure_debut, $heure_fin, $sal
 function addEnrollment(PDO $pdo, $id_student, $id_course, $statut = 'active') {
     $stmt = $pdo->prepare('SELECT id_enrollment FROM enrollments WHERE id_student = :id_student AND id_course = :id_course');
     $stmt->execute(['id_student' => $id_student, 'id_course' => $id_course]);
-    if ($stmt->fetch()) {
-        return;
+    $enrollment = $stmt->fetch();
+    if ($enrollment) {
+        return $enrollment['id_enrollment'];
     }
     $stmt = $pdo->prepare('INSERT INTO enrollments (id_student, id_course, date_inscription, statut) VALUES (:id_student, :id_course, CURDATE(), :statut)');
     $stmt->execute(['id_student' => $id_student, 'id_course' => $id_course, 'statut' => $statut]);
