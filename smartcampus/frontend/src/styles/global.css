@@ -152,6 +152,11 @@ thead th {
   color: #fecaca;
 }
 
+.success-message {
+  margin: 16px 0;
+  color: #bbf7d0;
+}
+
 .topbar {
   display: flex;
   justify-content: space-between;

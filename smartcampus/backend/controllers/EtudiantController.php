@@ -45,8 +45,17 @@ class EtudiantController {
         if (empty($input['email']) || empty($input['password']) || empty($input['nom']) || empty($input['prenom'])) {
             sendError('Champs obligatoires manquants', 400);
         }
+        if (!filter_var($input['email'], FILTER_VALIDATE_EMAIL)) {
+            sendError('Email invalide', 400);
+        }
 
         $pdo = getDatabaseConnection();
+        $stmt = $pdo->prepare('SELECT id_user FROM users WHERE email = :email');
+        $stmt->execute(['email' => $input['email']]);
+        if ($stmt->fetch()) {
+            sendError('Cet email est deja utilise', 400);
+        }
+
         $stmt = $pdo->prepare('INSERT INTO users (nom, prenom, email, mot_de_passe, role, telephone, date_creation) VALUES (:nom, :prenom, :email, :mot_de_passe, "student", :telephone, NOW())');
         $stmt->execute([
             'nom' => $input['nom'],
