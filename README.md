@@ -1,6 +1,12 @@
-# Projet-PP
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
 
-Ce dépôt contient le projet SmartCampus dans le dossier `smartcampus`.
-
-
-Voir `smartcampus/README.md` pour les instructions d'installation et de démarrage.
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': 'http://localhost:8000'
+    }
+  }
+})
