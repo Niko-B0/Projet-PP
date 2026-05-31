@@ -1,0 +1,1215 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <math.h>
+
+// =====================================================
+// WIFI / SERVEUR WEB
+// =====================================================
+const char* ssid     = "DrawBot";
+const char* password = "12345678";
+WebServer server(80);
+
+// =====================================================
+// I2C
+// =====================================================
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+const uint8_t ADDR_IMU = 0x6B;
+const uint8_t ADDR_MAG = 0x1E;
+
+// =====================================================
+// REGISTRES LSM6DS3
+// =====================================================
+#define CTRL1_XL   0x10
+#define CTRL2_G    0x11
+#define CTRL3_C    0x12
+#define OUTX_L_G   0x22   // Gyroscope X low byte
+#define OUTY_L_G   0x24   // Gyroscope Y low byte
+#define OUTZ_L_G   0x26   // Gyroscope Z low byte  ← angle de lacet (yaw)
+#define OUTX_L_XL  0x28
+#define OUTY_L_XL  0x2A
+#define OUTZ_L_XL  0x2C
+
+// =====================================================
+// REGISTRES LIS3MDL
+// =====================================================
+#define MAG_CTRL_REG1 0x20
+#define MAG_CTRL_REG2 0x21
+#define MAG_CTRL_REG3 0x22
+#define MAG_CTRL_REG4 0x23
+#define MAG_OUT_X_L   0x28
+
+// =====================================================
+// BROCHES MOTEURS
+// =====================================================
+#define EN_D   23
+#define EN_G    4
+#define IN_1_D 19
+#define IN_2_D 18
+#define IN_1_G 17
+#define IN_2_G 16
+
+// =====================================================
+// BROCHES ENCODEURS
+// =====================================================
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+// =====================================================
+// ETAT ROBOT
+// =====================================================
+enum Etat { STOP, AVANT, ARRIERE, GAUCHE, DROITE };
+Etat etatActuel = STOP;
+
+// =====================================================
+// VARIABLES IMU / CAP
+// =====================================================
+float accelX_ms2 = 0.0f, accelY_ms2 = 0.0f, accelGlobale_ms2 = 0.0f;
+float vitesseX_ms = 0.0f, vitesseY_ms = 0.0f, vitesseGlobale_ms = 0.0f;
+float posX_m = 0.0f, posY_m = 0.0f;
+float accelOffsetX = 0.0f, accelOffsetY = 0.0f;
+unsigned long lastUpdateMicros = 0;
+const float SEUIL_ACCEL   = 0.008f;
+const float SEUIL_VITESSE = 0.001f;
+const float GAIN_ACCEL_IMU = 3.0f;
+int immobileCounter = 0;
+
+// =====================================================
+// GYROSCOPE — offset et sensibilité
+// =====================================================
+// LSM6DS3 en mode 245 dps (CTRL2_G = 0x00 par défaut si pas de gyro init)
+// Sensibilité : 8.75 mdps/LSB → 0.00875 dps/LSB
+const float GYRO_SENS_DPS = 0.00875f;   // degrés/seconde par LSB
+float gyroOffsetZ = 0.0f;               // offset calibré au démarrage
+
+// =====================================================
+// MAGNETOMETRE / CAP
+// =====================================================
+float MAG_OFFSET_X = 0.0f, MAG_OFFSET_Y = 0.0f;
+float MAG_ANGLE_CORRECTION = 170.0f;
+float capDeg = 0.0f, headingDeg = 0.0f, headingReferenceDeg = 0.0f;
+
+// =====================================================
+// COMMANDE MOTEUR (mode manuel)
+// =====================================================
+int vitesseCommande = 0;
+int vitesseMax      = 255;
+int pas             = 50;
+bool robotMoving    = false;
+
+// =====================================================
+// ORIENTATION NORD
+// =====================================================
+float TOLERANCE_DEG = 5.0f;
+int   PWM_ROTATION  = 90;
+bool  orientationNordActive = false;
+
+// =====================================================
+// TRACES
+// =====================================================
+const int TRACE_MAX = 1000;
+float traceX[TRACE_MAX], traceY[TRACE_MAX];
+int   traceCount = 0;
+
+const int TRACE_ENC_MAX = 1000;
+float traceEncX[TRACE_ENC_MAX], traceEncY[TRACE_ENC_MAX];
+int   traceEncCount = 0;
+
+// =====================================================
+// ENCODEURS / ODOMETRIE
+// =====================================================
+const float RAYON_ROUE_CM    = 4.5f;
+const float CIRCONFERENCE_CM = 2.0f * PI * RAYON_ROUE_CM;
+const long  VARIATIONS_PAR_TOUR = 2100;
+const float DEG_PAR_VARIATION   = 180.0f / 1000.0f;
+
+volatile long countG = 0, countD = 0;
+long lastCountG = 0, lastCountD = 0;
+float posX_enc_cm = 0.0f, posY_enc_cm = 0.0f, theta_enc_deg = 0.0f;
+
+// =====================================================
+// FLAG SEQUENCE
+// =====================================================
+bool sequenceActive = false;
+
+// =====================================================
+// VARIABLE UI — angle rotation en cours
+// =====================================================
+float rotAngleCourant = 0.0f;
+
+// =====================================================
+// DISTANCES ESCALIER (paramétrables via /seqparams)
+// =====================================================
+float distSeg1Cm = 16.5f;
+float distSeg2Cm = 0.0f;
+float distSeg3Cm = 1.0f;
+
+// =====================================================
+// DISTANCE PARCOURUE EN TEMPS RÉEL (encodeurs)
+// =====================================================
+float distTotalCm = 0.0f;
+
+// =====================================================
+// PARAMETRES GEOMETRIQUES
+// =====================================================
+// Distance axe roues → pointe stylo (cm) — mesurée : 13 cm
+const float STYLO_AVANT_CM = 13.0f;
+
+// Entraxe roues centre à centre (cm) — mesuré : 8.2 cm
+const float ENTRAXE_CM = 8.2f;
+
+// Rayon de la roue gauche autour du centre de rotation
+// Centre = point sous le stylo sur l'axe des roues
+// R_G = STYLO_AVANT_CM + ENTRAXE_CM/2
+const float R_GAUCHE_CM = STYLO_AVANT_CM + ENTRAXE_CM / 2.0f;  // 17.1 cm
+
+// Rayon de la roue droite
+// R_D = STYLO_AVANT_CM - ENTRAXE_CM/2
+const float R_DROITE_CM = STYLO_AVANT_CM - ENTRAXE_CM / 2.0f;  // 8.9 cm
+
+// Rapport de vitesse : roue droite / roue gauche
+// Les deux roues doivent parcourir leur arc en même temps → même omega
+const float RATIO_VITESSE_D_SUR_G = R_DROITE_CM / R_GAUCHE_CM; // ≈ 0.521
+
+// =====================================================
+// PARAMETRES DE CONTROLE
+// =====================================================
+const int   SEQ_PWM_AVANCE   = 130;
+const int   SEQ_PWM_ROT_G    = 110;  // PWM roue gauche pendant rotation
+// PWM roue droite calculé : SEQ_PWM_ROT_G * RATIO
+// = 110 * 0.521 = 57 → arrondi à 57
+const int   SEQ_PWM_ROT_D    = (int)(110 * R_DROITE_CM / R_GAUCHE_CM);
+
+const long  TOL_TICKS_DIST   = 15;   // ~2 mm
+const float TOL_ANGLE_DEG    = 1.5f; // tolérance rotation
+
+const float GAIN_CORR_CAP    = 20.0f;  // correction cap avance ligne droite
+
+// Gain fusion gyro/encodeurs (0.0 = encodeurs purs, 1.0 = gyro pur)
+// On utilise 0.7 gyro + 0.3 encodeurs
+const float ALPHA_GYRO       = 0.7f;
+
+// =====================================================
+// TRACES — utilitaires
+// =====================================================
+
+// =====================================================
+// PROTOTYPES — déclarations anticipées
+// =====================================================
+void seqAvancerCm(float distCm);
+void seqRotationDiff90Droite();
+void seqRotationPivotGauche90();
+void executerSequenceEscalier();
+
+void clearTrace() { traceCount = 0; }
+void addTracePoint(float x, float y) {
+  if (traceCount == 0) { traceX[0] = x; traceY[0] = y; traceCount = 1; return; }
+  float dx = x - traceX[traceCount-1], dy = y - traceY[traceCount-1];
+  if (sqrt(dx*dx + dy*dy) < 0.0005f) return;
+  if (traceCount < TRACE_MAX) { traceX[traceCount] = x; traceY[traceCount] = y; traceCount++; }
+}
+void clearTraceEncodeurs() { traceEncCount = 0; }
+void addTracePointEncodeurs(float x, float y) {
+  if (traceEncCount == 0) { traceEncX[0] = x; traceEncY[0] = y; traceEncCount = 1; return; }
+  float dx = x - traceEncX[traceEncCount-1], dy = y - traceEncY[traceEncCount-1];
+  if (sqrt(dx*dx + dy*dy) < 0.1f) return;
+  if (traceEncCount < TRACE_ENC_MAX) { traceEncX[traceEncCount] = x; traceEncY[traceEncCount] = y; traceEncCount++; }
+}
+
+// =====================================================
+// INTERRUPTIONS ENCODEURS
+// =====================================================
+void IRAM_ATTR isrEncG() { countG++; }
+void IRAM_ATTR isrEncD() { countD++; }
+
+// =====================================================
+// ENCODEURS — utilitaires
+// =====================================================
+void resetEncodeurs() {
+  noInterrupts(); countG = 0; countD = 0; interrupts();
+  lastCountG = 0; lastCountD = 0;
+}
+void lireEncodeurs(long &g, long &d) {
+  noInterrupts(); g = countG; d = countD; interrupts();
+}
+float ticksToCm(long t) { return ((float)t / VARIATIONS_PAR_TOUR) * CIRCONFERENCE_CM; }
+long  cmToTicks(float cm) { return (long)((cm / CIRCONFERENCE_CM) * VARIATIONS_PAR_TOUR); }
+
+float normaliserAngle(float deg) {
+  while (deg < 0.0f)    deg += 360.0f;
+  while (deg >= 360.0f) deg -= 360.0f;
+  return deg;
+}
+float normaliserAngle180(float deg) {
+  while (deg >  180.0f) deg -= 360.0f;
+  while (deg < -180.0f) deg += 360.0f;
+  return deg;
+}
+
+void resetOdometryEncodeurs() {
+  posX_enc_cm = 0.0f; posY_enc_cm = 0.0f; theta_enc_deg = 0.0f;
+  long g, d; lireEncodeurs(g, d);
+  lastCountG = g; lastCountD = d;
+  clearTraceEncodeurs(); addTracePointEncodeurs(0, 0);
+}
+
+void updateOdometryEncodeurs() {
+  long g, d; lireEncodeurs(g, d);
+  long dg = g - lastCountG, dd = d - lastCountD;
+  lastCountG = g; lastCountD = d;
+  if (dg == 0 && dd == 0) return;
+  float dG = ticksToCm(dg), dD = ticksToCm(dd), dC = (dG + dD) / 2.0f;
+  if (etatActuel == AVANT) {
+    float r = theta_enc_deg * PI / 180.0f;
+    posX_enc_cm += dC * cos(r); posY_enc_cm += dC * sin(r);
+    addTracePointEncodeurs(posX_enc_cm, posY_enc_cm);
+  } else if (etatActuel == ARRIERE) {
+    float r = theta_enc_deg * PI / 180.0f;
+    posX_enc_cm -= dC * cos(r); posY_enc_cm -= dC * sin(r);
+    addTracePointEncodeurs(posX_enc_cm, posY_enc_cm);
+  } else if (etatActuel == GAUCHE) {
+    float dm = (dg + dd) / 2.0f;
+    theta_enc_deg = normaliserAngle(theta_enc_deg + dm * DEG_PAR_VARIATION);
+  } else if (etatActuel == DROITE) {
+    float dm = (dg + dd) / 2.0f;
+    theta_enc_deg = normaliserAngle(theta_enc_deg - dm * DEG_PAR_VARIATION);
+  }
+}
+
+// =====================================================
+// I2C
+// =====================================================
+void writeRegister(uint8_t addr, uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(value); Wire.endTransmission();
+}
+int16_t read16(uint8_t addr, uint8_t regLow) {
+  Wire.beginTransmission(addr); Wire.write(regLow); Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)addr, (uint8_t)2);
+  if (Wire.available() < 2) return 0;
+  uint8_t lo = Wire.read(), hi = Wire.read();
+  return (int16_t)((hi << 8) | lo);
+}
+
+// =====================================================
+// INIT CAPTEURS
+// =====================================================
+void initIMU() {
+  writeRegister(ADDR_IMU, CTRL3_C,  0b01000100);
+  // Accéléromètre 104 Hz, ±2g
+  writeRegister(ADDR_IMU, CTRL1_XL, 0b01000000);
+  // Gyroscope 104 Hz, ±245 dps  (bits [7:4]=0100 → 104Hz, bits [3:2]=00 → 245dps)
+  writeRegister(ADDR_IMU, CTRL2_G,  0b01000000);
+}
+void initMagnetometre() {
+  writeRegister(ADDR_MAG, MAG_CTRL_REG1, 0b01110000);
+  writeRegister(ADDR_MAG, MAG_CTRL_REG2, 0b00000000);
+  writeRegister(ADDR_MAG, MAG_CTRL_REG3, 0b00000000);
+  writeRegister(ADDR_MAG, MAG_CTRL_REG4, 0b00001100);
+}
+
+// =====================================================
+// CALIBRATION GYROSCOPE
+// Mesure l'offset Z au repos (biais de dérive)
+// =====================================================
+void calibrerGyro() {
+  const int N = 500;
+  long somme = 0;
+  Serial.println("Calibration gyroscope Z...");
+  for (int i = 0; i < N; i++) {
+    somme += read16(ADDR_IMU, OUTZ_L_G);
+    delay(5);
+  }
+  gyroOffsetZ = ((float)somme / N) * GYRO_SENS_DPS;
+  Serial.print("gyroOffsetZ = "); Serial.println(gyroOffsetZ, 6);
+}
+
+// =====================================================
+// LIRE VITESSE ANGULAIRE Z (degrés/seconde)
+// =====================================================
+float lireGyroZ_dps() {
+  int16_t raw = read16(ADDR_IMU, OUTZ_L_G);
+  return raw * GYRO_SENS_DPS - gyroOffsetZ;
+}
+
+// =====================================================
+// CALIBRATION ACCEL
+// =====================================================
+void calibrerAccel() {
+  const int N = 500;
+  long sx = 0, sy = 0;
+  Serial.println("Calibration accel...");
+  for (int i = 0; i < N; i++) {
+    sx += read16(ADDR_IMU, OUTX_L_XL);
+    sy += read16(ADDR_IMU, OUTY_L_XL);
+    delay(5);
+  }
+  accelOffsetX = ((float)sx / N) * 0.000061f * 9.81f;
+  accelOffsetY = ((float)sy / N) * 0.000061f * 9.81f;
+}
+
+void recalibrerAccelInstant() {
+  const int N = 50;
+  long sx = 0, sy = 0;
+  for (int i = 0; i < N; i++) {
+    sx += read16(ADDR_IMU, OUTX_L_XL);
+    sy += read16(ADDR_IMU, OUTY_L_XL);
+    delay(5);
+  }
+  accelOffsetX = ((float)sx / N) * 0.000061f * 9.81f;
+  accelOffsetY = ((float)sy / N) * 0.000061f * 9.81f;
+  accelX_ms2 = accelY_ms2 = accelGlobale_ms2 = 0.0f;
+  vitesseX_ms = vitesseY_ms = vitesseGlobale_ms = 0.0f;
+  immobileCounter = 0; lastUpdateMicros = micros();
+}
+
+// =====================================================
+// MAGNETOMETRE
+// =====================================================
+bool lireMagRaw(int16_t &mx, int16_t &my, int16_t &mz) {
+  Wire.beginTransmission(ADDR_MAG); Wire.write(MAG_OUT_X_L | 0x80);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom((uint8_t)ADDR_MAG, (uint8_t)6);
+  if (Wire.available() < 6) return false;
+  uint8_t xl=Wire.read(),xh=Wire.read(),yl=Wire.read(),yh=Wire.read(),zl=Wire.read(),zh=Wire.read();
+  mx=(int16_t)((xh<<8)|xl); my=(int16_t)((yh<<8)|yl); mz=(int16_t)((zh<<8)|zl);
+  return true;
+}
+float lireCapDeg() {
+  int16_t mx, my, mz;
+  if (!lireMagRaw(mx, my, mz)) return NAN;
+  float x = (float)mx - MAG_OFFSET_X, y = (float)my - MAG_OFFSET_Y;
+  float angle = atan2(y, x) * 180.0f / PI;
+  if (angle < 0) angle += 360.0f;
+  angle += MAG_ANGLE_CORRECTION;
+  if (angle >= 360.0f) angle -= 360.0f;
+  return angle;
+}
+void setHeadingReference() {
+  const int N = 200; long smx=0, smy=0; int ok=0;
+  for (int i=0; i<N; i++) {
+    int16_t mx,my,mz;
+    if (lireMagRaw(mx,my,mz)) { smx+=mx; smy+=my; ok++; }
+    delay(5);
+  }
+  if (ok==0) return;
+  float a = atan2((float)smy/ok,(float)smx/ok)*180.0f/PI;
+  if (a<0) a+=360.0f;
+  headingReferenceDeg = a;
+}
+void updateHeading() {
+  int16_t mx,my,mz;
+  if (!lireMagRaw(mx,my,mz)) return;
+  float a = atan2((float)my,(float)mx)*180.0f/PI;
+  if (a<0) a+=360.0f;
+  headingDeg = a - headingReferenceDeg;
+  if (headingDeg<0) headingDeg+=360.0f;
+  if (headingDeg>=360.0f) headingDeg-=360.0f;
+  float cap = lireCapDeg();
+  if (!isnan(cap)) capDeg = cap;
+}
+
+// =====================================================
+// MOTEURS — interface manuelle
+// =====================================================
+void stopMoteurs() { ledcWrite(0,0);ledcWrite(1,0);ledcWrite(2,0);ledcWrite(3,0); }
+void avancer(int p)     { p=constrain(p,0,255); ledcWrite(1,p);ledcWrite(0,0);ledcWrite(2,p);ledcWrite(3,0); }
+void reculer(int p)     { p=constrain(p,0,255); ledcWrite(1,0);ledcWrite(0,p);ledcWrite(2,0);ledcWrite(3,p); }
+void tournerGauche(int p){ p=constrain(p,0,255); ledcWrite(1,p);ledcWrite(0,0);ledcWrite(2,0);ledcWrite(3,p); }
+void tournerDroite(int p){ p=constrain(p,0,255); ledcWrite(1,0);ledcWrite(0,p);ledcWrite(2,p);ledcWrite(3,0); }
+
+// =====================================================
+// MOTEURS INDIVIDUELS (séquences automatiques)
+// pwm positif = avant, négatif = arrière
+// =====================================================
+void motorG(int pwm) {
+  pwm = constrain(pwm,-255,255);
+  if      (pwm>0) { ledcWrite(2,pwm); ledcWrite(3,0);    }
+  else if (pwm<0) { ledcWrite(2,0);   ledcWrite(3,-pwm); }
+  else            { ledcWrite(2,0);   ledcWrite(3,0);     }
+}
+void motorD(int pwm) {
+  pwm = constrain(pwm,-255,255);
+  if      (pwm>0) { ledcWrite(1,pwm); ledcWrite(0,0);    }
+  else if (pwm<0) { ledcWrite(1,0);   ledcWrite(0,-pwm); }
+  else            { ledcWrite(1,0);   ledcWrite(0,0);     }
+}
+
+void appliquerMouvement() {
+  switch (etatActuel) {
+    case AVANT:   avancer(vitesseCommande);       robotMoving=true;  break;
+    case ARRIERE: reculer(vitesseCommande);        robotMoving=true;  break;
+    case GAUCHE:  tournerGauche(vitesseCommande);  robotMoving=false; break;
+    case DROITE:  tournerDroite(vitesseCommande);  robotMoving=false; break;
+    case STOP:    stopMoteurs();                   robotMoving=false; break;
+  }
+}
+
+// =====================================================
+// UPDATE POSITION IMU
+// =====================================================
+void updatePosition() {
+  unsigned long now = micros();
+  if (lastUpdateMicros==0) { lastUpdateMicros=now; return; }
+  float dt = (now-lastUpdateMicros)/1000000.0f;
+  lastUpdateMicros = now;
+  if (dt<=0.0f||dt>0.2f) return;
+
+  int16_t rawX=read16(ADDR_IMU,OUTX_L_XL), rawY=read16(ADDR_IMU,OUTY_L_XL);
+  float ax=rawX*0.000061f*9.81f-accelOffsetX, ay=rawY*0.000061f*9.81f-accelOffsetY;
+  if (fabs(ax)<SEUIL_ACCEL) ax=0; if (fabs(ay)<SEUIL_ACCEL) ay=0;
+  accelX_ms2=ax; accelY_ms2=ay;
+  accelGlobale_ms2=sqrt(ax*ax+ay*ay);
+
+  if (!robotMoving||etatActuel==STOP||etatActuel==GAUCHE||etatActuel==DROITE) {
+    vitesseX_ms=vitesseY_ms=vitesseGlobale_ms=0; immobileCounter=0; return;
+  }
+  float theta=headingDeg*PI/180.0f;
+  float axw=(ax*cos(theta)-ay*sin(theta))*GAIN_ACCEL_IMU;
+  float ayw=(ax*sin(theta)+ay*cos(theta))*GAIN_ACCEL_IMU;
+  vitesseX_ms+=axw*dt; vitesseY_ms+=ayw*dt;
+  vitesseX_ms*=0.995f; vitesseY_ms*=0.995f;
+  vitesseX_ms=constrain(vitesseX_ms,-1.5f,1.5f);
+  vitesseY_ms=constrain(vitesseY_ms,-1.5f,1.5f);
+  vitesseGlobale_ms=sqrt(vitesseX_ms*vitesseX_ms+vitesseY_ms*vitesseY_ms);
+  posX_m+=vitesseX_ms*dt; posY_m+=vitesseY_ms*dt;
+  addTracePoint(posX_m,posY_m);
+}
+
+// =====================================================
+// ORIENTATION NORD
+// =====================================================
+void updateOrientationNord() {
+  if (!orientationNordActive) return;
+  float cap=lireCapDeg();
+  if (isnan(cap)) { stopMoteurs(); orientationNordActive=false; return; }
+  capDeg=cap;
+  float err=cap; while(err>180)err-=360; while(err<-180)err+=360;
+  err=-err;
+  if (fabs(err)<=TOLERANCE_DEG) {
+    stopMoteurs(); orientationNordActive=false;
+    etatActuel=STOP; vitesseCommande=0; robotMoving=false; return;
+  }
+  int pwm=(fabs(err)<10)?95:(fabs(err)<20)?110:PWM_ROTATION;
+  if (err>0){tournerGauche(pwm);etatActuel=GAUCHE;}
+  else      {tournerDroite(pwm);etatActuel=DROITE;}
+}
+
+// =====================================================
+// RESET GLOBAL
+// =====================================================
+void resetPositionEtVitesses() {
+  posX_m=posY_m=0;
+  accelX_ms2=accelY_ms2=accelGlobale_ms2=0;
+  vitesseX_ms=vitesseY_ms=vitesseGlobale_ms=0;
+  immobileCounter=0; robotMoving=false;
+  clearTrace(); addTracePoint(0,0);
+  resetEncodeurs(); resetOdometryEncodeurs();
+  lastUpdateMicros=micros();
+}
+
+// =====================================================
+// PRIMITIVE : AVANCER EN LIGNE DROITE
+// =====================================================
+void seqAvancerCm(float distCm) {
+  resetEncodeurs();
+  long ticksCible = cmToTicks(distCm);
+  etatActuel = AVANT; robotMoving = true;
+  long g0=0, d0=0;
+  float segStart = distTotalCm;
+
+  while (true) {
+    server.handleClient();
+    updateHeading(); updatePosition(); updateOdometryEncodeurs();
+    long g,d; lireEncodeurs(g,d);
+    distTotalCm = segStart + ticksToCm((g+d)/2);
+    if ((g+d)/2 >= ticksCible - TOL_TICKS_DIST) {
+      stopMoteurs(); etatActuel=STOP; robotMoving=false; delay(120); return;
+    }
+    float errCap = (float)((g-g0)-(d-d0));
+    float corr   = constrain(GAIN_CORR_CAP*errCap,-40.f,40.f);
+    g0=g; d0=d;
+    motorG(constrain((int)(SEQ_PWM_AVANCE-corr),60,255));
+    motorD(constrain((int)(SEQ_PWM_AVANCE+corr),60,255));
+    delay(5);
+  }
+}
+
+// =====================================================
+// ROTATION EN 3 PHASES — 90° vers la droite
+//
+// PHASE A  (0° → 6°) : pivot pur
+//   Roue droite = 0 (immobile)
+//   Roue gauche = SEQ_PWM_ROT_G
+//   Centre de rotation = axe roue droite
+//   → Virage très serré, courbure maximale
+//
+// PHASE B  (6° → 90°) : accélération progressive roue droite
+//   Roue gauche = SEQ_PWM_ROT_G (constante)
+//   Roue droite = SEQ_PWM_ROT_G × progress  (0 → 1)
+//   où progress = (angle - 45) / 45  (linéaire)
+//   → Rayon de courbure augmente progressivement
+//   → À 90° : les deux roues ont la même vitesse → ligne droite
+//
+// Angle mesuré par fusion gyro (70%) + encodeurs (30%)
+// =====================================================
+void seqRotationDiff90Droite() {
+  resetEncodeurs();
+
+  const float ANGLE_CIBLE    = 90.0f;
+  const float ANGLE_PIVOT    = 10.0f / ENTRAXE_CM * (180.0f / PI); // phase A = 10 cm d'arc roue active
+
+  float angleGyro   = 0.0f;
+  float angleFusion = 0.0f;
+  unsigned long tPrev = micros();
+
+  etatActuel  = DROITE;
+  robotMoving = false;
+
+  Serial.println("  Rotation 3 phases...");
+
+  while (true) {
+    server.handleClient();
+    updateHeading();
+
+    // --- Temps écoulé ---
+    unsigned long tNow = micros();
+    float dt = (tNow - tPrev) / 1000000.0f;
+    tPrev = tNow;
+    if (dt <= 0 || dt > 0.1f) dt = 0.005f;
+
+    // --- Gyro ---
+    float gz = lireGyroZ_dps();
+    angleGyro += gz * dt;
+
+    // --- Encodeurs ---
+    long g, d;
+    lireEncodeurs(g, d);
+    float arcG = ticksToCm(g);
+    float arcD = ticksToCm(d);
+    float angleEnc = ((arcG - arcD) / ENTRAXE_CM) * (180.0f / PI);
+
+    // --- Fusion ---
+    angleFusion = ALPHA_GYRO * angleGyro + (1.0f - ALPHA_GYRO) * angleEnc;
+
+    // Mise à jour variable UI
+    rotAngleCourant = angleFusion;
+
+    // --- Condition d'arrêt ---
+    if (angleFusion >= ANGLE_CIBLE - TOL_ANGLE_DEG) {
+      stopMoteurs();
+      etatActuel  = STOP;
+      robotMoving = false;
+      Serial.print("  Rotation terminee : ");
+      Serial.print(angleFusion);
+      Serial.println(" deg");
+      delay(150);
+      return;
+    }
+
+    // --- Calcul des PWM selon la phase ---
+    int pwmG, pwmD;
+
+    if (angleFusion < ANGLE_PIVOT) {
+      // ── PHASE A : pivot pur (0° → 6°) ──────────────────
+      // Roue droite immobile, roue gauche à vitesse constante
+      pwmG = SEQ_PWM_ROT_G;
+      pwmD = 0;
+
+    } else {
+      // ── PHASE B : accélération progressive (6° → 90°) ──
+      // progress : 0.0 au début de la phase, 1.0 à 90°
+      float progress = (angleFusion - ANGLE_PIVOT) / (ANGLE_CIBLE - ANGLE_PIVOT);
+      progress = constrain(progress, 0.0f, 1.0f);
+
+      // Roue gauche : légère correction si en retard
+      float erreur = ANGLE_CIBLE - angleFusion;
+      float corrG  = constrain(erreur * 0.4f, -12.0f, 12.0f);
+      pwmG = constrain(SEQ_PWM_ROT_G + (int)corrG, 60, 180);
+
+      // Roue droite : monte plus vite (expo < 1 = courbe concave)
+      pwmD = (int)(pwmG * powf(progress, 0.7f));
+      pwmD = constrain(pwmD, 0, 180);
+    }
+
+    motorG(pwmG);
+    motorD(pwmD);
+    delay(5);
+  }
+}
+
+// =====================================================
+// SEQUENCE ESCALIER
+// 1. Avancer 20 cm (segment vertical)
+// 2. Rotation différentielle 90° droite (stylo reste
+//    dans la continuité verticale)
+// 3. Avancer 10 cm (segment horizontal)
+// =====================================================
+// =====================================================
+// ROTATION PIVOT 90° vers la GAUCHE
+// Roue gauche = 0 (immobile, pivot)
+// Roue droite = SEQ_PWM_ROT_G (tourne en avant)
+// =====================================================
+void seqRotationPivotGauche90() {
+  resetEncodeurs();
+
+  const float ANGLE_CIBLE   = 100.08f;
+  const float ANGLE_PIVOT   = 10.0f / ENTRAXE_CM * (180.0f / PI); // phase A = 10 cm d'arc roue active
+  // Tolérance réduite : on coupe les moteurs plus tard
+  // pour compenser l'inertie qui fait s'arrêter le robot trop tôt
+  const float TOL_LOCALE    = 0.3f;
+
+  float angleGyro   = 0.0f;
+  float angleFusion = 0.0f;
+  unsigned long tPrev = micros();
+
+  etatActuel  = GAUCHE;
+  robotMoving = false;
+
+  Serial.println("  Rotation 3 phases GAUCHE...");
+
+  while (true) {
+    server.handleClient();
+    updateHeading();
+
+    unsigned long tNow = micros();
+    float dt = (tNow - tPrev) / 1000000.0f;
+    tPrev = tNow;
+    if (dt <= 0 || dt > 0.1f) dt = 0.005f;
+
+    float gz = lireGyroZ_dps();
+    angleGyro += (-gz) * dt;
+
+    long g, d;
+    lireEncodeurs(g, d);
+    float arcG     = ticksToCm(g);
+    float arcD     = ticksToCm(d);
+    float angleEnc = ((arcD - arcG) / ENTRAXE_CM) * (180.0f / PI);
+
+    angleFusion = ALPHA_GYRO * angleGyro + (1.0f - ALPHA_GYRO) * angleEnc;
+    rotAngleCourant = angleFusion;
+
+    // Arrêt avec tolérance locale réduite à 0.3°
+    if (angleFusion >= ANGLE_CIBLE - TOL_LOCALE) {
+      stopMoteurs();
+      etatActuel  = STOP;
+      robotMoving = false;
+      Serial.print("  Rotation GAUCHE terminee : ");
+      Serial.print(angleFusion);
+      Serial.println(" deg");
+      // Pas de delay ici : on laisse l'inertie finir les derniers degrés
+      return;
+    }
+
+    int pwmG, pwmD;
+
+    if (angleFusion < ANGLE_PIVOT) {
+      pwmD = SEQ_PWM_ROT_G;
+      pwmG = 0;
+    } else {
+      float progress = (angleFusion - ANGLE_PIVOT) / (ANGLE_CIBLE - ANGLE_PIVOT);
+      progress = constrain(progress, 0.0f, 1.0f);
+
+      float erreur = ANGLE_CIBLE - angleFusion;
+      float corrD  = constrain(erreur * 0.4f, -12.0f, 12.0f);
+      pwmD = constrain(SEQ_PWM_ROT_G + (int)corrD, 60, 180);
+
+      // Roue gauche : monte plus lentement (expo > 1 = courbe convexe)
+      pwmG = (int)(pwmD * powf(progress, 1.4f));
+      pwmG = constrain(pwmG, 0, 180);
+    }
+
+    motorG(pwmG);
+    motorD(pwmD);
+    delay(5);
+  }
+}
+
+// =====================================================
+// SEQUENCE ESCALIER COMPLET
+//
+// Le virage droite est un pivot pur (roue D = 0).
+// L'arc tracé par le stylo pendant ce pivot vaut :
+//   arc = STYLO_AVANT_CM × (π/2) ≈ 13 × 1.571 ≈ 20.4 cm
+// Mais ce déplacement est dans l'axe vertical du robot
+// (continuation du trait), donc il "consomme" de la distance.
+//
+// On veut 10 cm utiles APRES le virage droite.
+// Le virage lui-même ne déplace pas le robot latéralement
+// mais avance le stylo de STYLO_AVANT_CM vers la droite.
+// Les 10 cm après sont donc bien 10 cm horizontaux nets.
+//
+// Séquence :
+// 1. Avancer 20 cm  (segment vertical)
+// 2. Virage 90° droite  (pivot roue D)
+// 3. Avancer 10 cm  (segment horizontal droite)
+// 4. Virage 90° gauche  (pivot roue G)
+// 5. Avancer 10 cm  (segment vertical bas)
+// =====================================================
+void executerSequenceEscalier() {
+  Serial.println("=== SEQUENCE ESCALIER ===");
+  distTotalCm = 0.0f;
+
+  Serial.print("Segment 1 : avance "); Serial.print(distSeg1Cm); Serial.println(" cm");
+  seqAvancerCm(distSeg1Cm);
+  delay(200);
+
+  Serial.println("Virage 1 : 90 deg droite");
+  seqRotationDiff90Droite();
+  delay(200);
+
+  Serial.print("Segment 2 : avance "); Serial.print(distSeg2Cm); Serial.println(" cm");
+  seqAvancerCm(distSeg2Cm);
+  delay(200);
+
+  Serial.println("Virage 2 : 90 deg gauche");
+  seqRotationPivotGauche90();
+  delay(200);
+
+  Serial.print("Segment 3 : avance "); Serial.print(distSeg3Cm); Serial.println(" cm");
+  seqAvancerCm(distSeg3Cm);
+  delay(200);
+
+  sequenceActive = false;
+  Serial.println("=== FIN SEQUENCE ESCALIER ===");
+}
+// =====================================================
+// PAGE WEB
+// =====================================================
+String pageHTML() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>DrawBot Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0d0d0d;height:100vh;overflow:hidden;font-family:Arial,sans-serif;color:white;padding:10px}
+    .layout{display:grid;grid-template-columns:280px 1fr 330px;grid-template-rows:1fr 1fr;gap:10px;height:calc(100vh - 20px)}
+    .panel{background:linear-gradient(180deg,#111,#1a1a1a);border:1px solid #333;border-radius:16px;padding:12px;box-shadow:0 3px 12px rgba(0,0,0,.35);overflow:hidden}
+    .data-panel{grid-column:1;grid-row:1/3}
+    .control-panel{grid-column:2;grid-row:1/3;display:flex;flex-direction:column;justify-content:center;align-items:center;min-width:0}
+    .map-panel{grid-column:3;grid-row:1}
+    .encoder-map-panel{grid-column:3;grid-row:2}
+    h1{font-size:12px;letter-spacing:2px;text-align:center;text-transform:uppercase;color:#ccc;margin-bottom:8px}
+    .big-value{text-align:center;font-family:"Courier New",monospace;font-size:26px;color:#00e5ff;margin-bottom:8px}
+    .compass{position:relative;width:115px;height:115px;border:2px solid white;border-radius:50%;margin:8px auto 12px}
+    .compass .n{position:absolute;top:4px;left:50%;transform:translateX(-50%);color:red;font-size:16px;font-weight:bold}
+    .compass .s{position:absolute;bottom:4px;left:50%;transform:translateX(-50%);color:#ddd;font-size:14px}
+    .compass .e{position:absolute;right:7px;top:50%;transform:translateY(-50%);color:#ddd;font-size:14px}
+    .compass .w{position:absolute;left:7px;top:50%;transform:translateY(-50%);color:#ddd;font-size:14px}
+    #compassArrow{position:absolute;width:5px;height:43px;background:cyan;left:50%;top:50%;transform-origin:bottom center;transform:translate(-50%,-100%) rotate(0deg);border-radius:6px}
+    #compassArrow::before{content:"";position:absolute;top:-11px;left:-7px;border-left:10px solid transparent;border-right:10px solid transparent;border-bottom:15px solid cyan}
+    .data-card{background:#0a0a0a;border:1px solid #282828;border-radius:10px;padding:8px;margin-bottom:6px}
+    .label{font-size:9px;color:#777;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+    .value{font-family:"Courier New",monospace;font-size:15px;color:#00e5ff;font-weight:bold}
+    .unit{font-size:10px;color:#aaa}
+    .wheel{position:relative;width:250px;height:250px;border:22px solid #202020;border-top-color:#e10600;border-radius:50%;transition:transform .25s ease}
+    .cmd-btn{position:absolute;background:#1e1e1e;border:1px solid #444;border-radius:9px;color:white;padding:8px;cursor:pointer;font-weight:bold;font-size:12px}
+    .cmd-btn:active{background:#e10600}
+    .avant{top:25px;left:50%;transform:translateX(-50%)}
+    .arriere{bottom:25px;left:50%;transform:translateX(-50%)}
+    .gauche{left:22px;top:50%;transform:translateY(-50%)}
+    .droite{right:22px;top:50%;transform:translateY(-50%)}
+    .stop{top:50%;left:50%;transform:translate(-50%,-50%);background:#260000;border-color:#e10600;width:64px;height:64px;border-radius:50%;z-index:5;color:#ff4b4b;font-size:12px}
+    .hud{display:flex;gap:8px;margin-top:14px}
+    .hud-card{background:#111;border:1px solid #333;border-radius:10px;padding:8px 12px;text-align:center;min-width:80px}
+    .action-row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;justify-content:center}
+    button.action{background:#252525;border:1px solid #444;color:white;border-radius:9px;padding:8px 10px;cursor:pointer;font-size:12px}
+    button.blue{background:#00bcd4;color:#071014;border:none}
+    button.red{background:#e10600;color:white;border:none}
+    button.orange{background:#ff9800;color:#111;border:none;font-weight:bold}
+    button.seq{background:#7c3aed;color:white;border:none;font-weight:bold;font-size:13px;padding:10px 16px;border-radius:9px;cursor:pointer;letter-spacing:1px;transition:background .2s,opacity .2s}
+    button.seq:hover{background:#6d28d9}
+    button.seq:disabled{opacity:.45;cursor:not-allowed}
+    canvas{width:100%;max-width:285px;height:auto;background:white;border:1px solid #333;display:block;margin:0 auto}
+    .map-info{text-align:center;margin-top:6px;color:#ccc;font-size:11px}
+    .gyro-bar-wrap{width:100%;background:#1a1a1a;border:1px solid #333;border-radius:6px;height:12px;margin-top:4px;overflow:hidden}
+    .gyro-bar{height:100%;background:#7c3aed;width:0%;transition:width .1s;border-radius:6px}
+    @media(max-width:1000px){body{height:auto;overflow:auto}.layout{grid-template-columns:1fr;grid-template-rows:auto;height:auto}.data-panel,.control-panel,.map-panel,.encoder-map-panel{grid-column:1;grid-row:auto}}
+  </style>
+</head>
+<body>
+<div class="layout">
+
+  <div class="panel data-panel">
+    <h1>Données capteurs</h1>
+    <div class="big-value"><span id="cap">--</span>°</div>
+    <div class="compass">
+      <div class="n">N</div><div class="s">S</div><div class="e">E</div><div class="w">W</div>
+      <div id="compassArrow"></div>
+    </div>
+    <div class="data-card"><div class="label">Accélération X</div><div class="value"><span id="ax">0</span> <span class="unit">m/s²</span></div></div>
+    <div class="data-card"><div class="label">Accélération Y</div><div class="value"><span id="ay">0</span> <span class="unit">m/s²</span></div></div>
+    <div class="data-card"><div class="label">Vitesse X estimée</div><div class="value"><span id="vx">0</span> <span class="unit">m/s</span></div></div>
+    <div class="data-card"><div class="label">Vitesse Y estimée</div><div class="value"><span id="vy">0</span> <span class="unit">m/s</span></div></div>
+    <div class="data-card"><div class="label">Position X IMU</div><div class="value"><span id="px">0</span> <span class="unit">m</span></div></div>
+    <div class="data-card"><div class="label">Position Y IMU</div><div class="value"><span id="py">0</span> <span class="unit">m</span></div></div>
+    <div class="data-card">
+      <div class="label">Angle rotation (fusion)</div>
+      <div class="value"><span id="rotAngle">0</span><span class="unit"> °</span></div>
+      <div class="gyro-bar-wrap"><div class="gyro-bar" id="rotBar"></div></div>
+    </div>
+    <div class="data-card">
+      <div class="label">Distance parcourue</div>
+      <div class="value"><span id="distTotal">0.0</span> <span class="unit">cm</span></div>
+    </div>
+  </div>
+
+  <div class="panel control-panel">
+    <h1>DrawBot Control</h1>
+    <div class="wheel" id="wheel">
+      <button class="cmd-btn avant"   onclick="cmd('/avant','AVANT',0)">▲<br>Avancer</button>
+      <button class="cmd-btn arriere" onclick="cmd('/arriere','RECULER',0)">▼<br>Reculer</button>
+      <button class="cmd-btn gauche"  onclick="cmd('/gauche','GAUCHE',-35)">◀</button>
+      <button class="cmd-btn droite"  onclick="cmd('/droite','DROITE',35)">▶</button>
+      <button class="cmd-btn stop"    onclick="cmd('/stop','STOP',0,true)">STOP</button>
+    </div>
+    <div class="hud">
+      <div class="hud-card"><div class="label">PWM</div><div class="value" id="pwm">0</div></div>
+      <div class="hud-card"><div class="label">Etat</div><div class="value" id="etat">STOP</div></div>
+      <div class="hud-card"><div class="label">Angle</div><div class="value" id="angle">0°</div></div>
+    </div>
+    <div class="action-row">
+      <button class="action orange" onclick="recalibrerAccel()">Zéro accel</button>
+      <button class="action"        onclick="sendSimple('/reset')">Reset pos</button>
+      <button class="action"        onclick="sendSimple('/cleartrace')">Effacer</button>
+      <button class="action blue"   onclick="sendSimple('/nord')">Nord</button>
+      <button class="action red"    onclick="cmd('/stop','STOP',0,true)">Stop</button>
+    </div>
+    <div class="action-row" style="margin-top:16px;border-top:1px solid #2a2a2a;padding-top:14px;">
+      <button class="seq" id="btnSeq" onclick="lancerSequence()">&#9654; ESCALIER</button>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;justify-content:center;align-items:flex-end;">
+      <div style="text-align:center;">
+        <div class="label" style="font-size:8px;margin-bottom:3px;">Seg.1 (cm)</div>
+        <input id="d1" type="number" value="16.5" step="0.5" min="0" max="200"
+          style="width:68px;background:#111;border:1px solid #444;border-radius:6px;color:#00e5ff;font-family:'Courier New',monospace;font-size:14px;font-weight:bold;text-align:center;padding:5px 2px;">
+      </div>
+      <div style="text-align:center;">
+        <div class="label" style="font-size:8px;margin-bottom:3px;">Seg.2 (cm)</div>
+        <input id="d2" type="number" value="0" step="0.5" min="0" max="200"
+          style="width:68px;background:#111;border:1px solid #444;border-radius:6px;color:#00e5ff;font-family:'Courier New',monospace;font-size:14px;font-weight:bold;text-align:center;padding:5px 2px;">
+      </div>
+      <div style="text-align:center;">
+        <div class="label" style="font-size:8px;margin-bottom:3px;">Seg.3 (cm)</div>
+        <input id="d3" type="number" value="1" step="0.5" min="0" max="200"
+          style="width:68px;background:#111;border:1px solid #444;border-radius:6px;color:#00e5ff;font-family:'Courier New',monospace;font-size:14px;font-weight:bold;text-align:center;padding:5px 2px;">
+      </div>
+    </div>
+    <div style="margin-top:8px;font-size:10px;color:#555;text-align:center;">
+      Rotation différentielle · R_G=17.1cm · R_D=8.9cm · Gyro+Enc
+    </div>
+  </div>
+
+  <div class="panel map-panel">
+    <h1>Carte IMU</h1>
+    <canvas id="map" width="370" height="370"></canvas>
+    <div class="map-info">X=<span id="mapx">0</span>m | Y=<span id="mapy">0</span>m | Cap=<span id="maph">0</span>°</div>
+  </div>
+
+  <div class="panel encoder-map-panel">
+    <h1>Carte encodeurs</h1>
+    <canvas id="mapEnc" width="370" height="370"></canvas>
+    <div class="map-info">X=<span id="encx">0</span>cm | Y=<span id="ency">0</span>cm | Cap=<span id="ench">0</span>°</div>
+    <div class="map-info">G=<span id="encg">0</span> | D=<span id="encd">0</span></div>
+  </div>
+
+</div>
+<script>
+  let currentAngle=0, seqRunning=false;
+  const canvas=document.getElementById("map"), ctx=canvas.getContext("2d");
+  const canvasEnc=document.getElementById("mapEnc"), ctxEnc=canvasEnc.getContext("2d");
+
+  function sendSimple(url){fetch(url+'?t='+Date.now())}
+
+  async function recalibrerAccel(){
+    if(!confirm("Ne bouge pas le robot. Continuer ?"))return;
+    document.getElementById("etat").textContent="RECALIBRATION";
+    await fetch('/recalibrer?t='+Date.now());
+    document.getElementById("etat").textContent="STOP";
+  }
+
+  async function lancerSequence(){
+    if(seqRunning)return;
+    const d1=parseFloat(document.getElementById("d1").value)||16.5;
+    const d2=parseFloat(document.getElementById("d2").value)||0;
+    const d3=parseFloat(document.getElementById("d3").value)||1;
+    if(!confirm("Lancer la sequence ?\n  Seg1 = "+d1+" cm\n  Seg2 = "+d2+" cm\n  Seg3 = "+d3+" cm"))return;
+    seqRunning=true;
+    const btn=document.getElementById("btnSeq");
+    btn.disabled=true; btn.textContent="En cours...";
+    document.getElementById("etat").textContent="ESCALIER";
+    try{
+      await fetch('/seqparams?d1='+d1+'&d2='+d2+'&d3='+d3+'&t='+Date.now());
+      await fetch('/sequenceEscalier?t='+Date.now());
+    }catch(e){}
+    btn.disabled=false; btn.textContent="▶ Escalier \u00a0(20cm → 90°D → 10cm)";
+    document.getElementById("etat").textContent="STOP";
+    seqRunning=false;
+  }
+
+  function cmd(url,label,angleDelta,isStop){
+    fetch(url+'?t='+Date.now());
+    if(isStop){currentAngle=0}else{
+      currentAngle=Math.max(-180,Math.min(180,currentAngle+angleDelta));
+    }
+    document.getElementById("wheel").style.transform="rotate("+currentAngle+"deg)";
+    document.getElementById("etat").textContent=label;
+    document.getElementById("angle").textContent=currentAngle+"°";
+  }
+
+  function drawGrid(c,cv){
+    c.clearRect(0,0,cv.width,cv.height);
+    c.strokeStyle="#e0e0e0";c.lineWidth=1;
+    for(let i=0;i<=cv.width;i+=50){c.beginPath();c.moveTo(i,0);c.lineTo(i,cv.height);c.stroke()}
+    for(let j=0;j<=cv.height;j+=50){c.beginPath();c.moveTo(0,j);c.lineTo(cv.width,j);c.stroke()}
+    c.strokeStyle="#888";
+    c.beginPath();c.moveTo(cv.width/2,0);c.lineTo(cv.width/2,cv.height);c.stroke();
+    c.beginPath();c.moveTo(0,cv.height/2);c.lineTo(cv.width,cv.height/2);c.stroke();
+  }
+  function toM(x,y){return{x:canvas.width/2+x*100,y:canvas.height/2-y*100}}
+  function toCm(x,y){return{x:canvasEnc.width/2+x*5,y:canvasEnc.height/2-y*5}}
+
+  function drawTrace(c,trace,fn){
+    if(!trace||trace.length<2)return;
+    c.strokeStyle="#00aa00";c.lineWidth=2;c.beginPath();
+    let p0=fn(trace[0].x,trace[0].y);c.moveTo(p0.x,p0.y);
+    for(let i=1;i<trace.length;i++){let p=fn(trace[i].x,trace[i].y);c.lineTo(p.x,p.y)}
+    c.stroke();
+  }
+  function drawRobot(c,x,y,h,fn){
+    const p=fn(x,y),a=-h*Math.PI/180;
+    c.fillStyle="red";c.beginPath();c.arc(p.x,p.y,6,0,2*Math.PI);c.fill();
+    c.strokeStyle="blue";c.lineWidth=3;c.beginPath();
+    c.moveTo(p.x,p.y);c.lineTo(p.x+28*Math.cos(a),p.y+28*Math.sin(a));c.stroke();
+  }
+
+  async function updateData(){
+    try{
+      const r=await fetch('/data?t='+Date.now());
+      const d=await r.json();
+      document.getElementById("ax").textContent=d.accelX.toFixed(3);
+      document.getElementById("ay").textContent=d.accelY.toFixed(3);
+      document.getElementById("vx").textContent=d.vitesseX.toFixed(3);
+      document.getElementById("vy").textContent=d.vitesseY.toFixed(3);
+      document.getElementById("px").textContent=d.x.toFixed(3);
+      document.getElementById("py").textContent=d.y.toFixed(3);
+      document.getElementById("mapx").textContent=d.x.toFixed(3);
+      document.getElementById("mapy").textContent=d.y.toFixed(3);
+      document.getElementById("maph").textContent=d.heading.toFixed(1);
+      document.getElementById("encx").textContent=d.encX.toFixed(2);
+      document.getElementById("ency").textContent=d.encY.toFixed(2);
+      document.getElementById("ench").textContent=d.encHeading.toFixed(1);
+      document.getElementById("encg").textContent=d.countG;
+      document.getElementById("encd").textContent=d.countD;
+      document.getElementById("pwm").textContent=d.vitesseCommande;
+      if(d.capOk){
+        document.getElementById("cap").textContent=d.cap.toFixed(1);
+        document.getElementById("compassArrow").style.transform="translate(-50%,-100%) rotate("+d.cap+"deg)";
+      }else{document.getElementById("cap").textContent="--"}
+      // Barre d'angle rotation
+      if(d.rotAngle!==undefined){
+        document.getElementById("rotAngle").textContent=d.rotAngle.toFixed(1);
+        document.getElementById("rotBar").style.width=Math.min(d.rotAngle/90*100,100)+"%";
+      }
+      if(d.distTotal!==undefined){
+        document.getElementById("distTotal").textContent=d.distTotal.toFixed(1);
+      }
+      drawGrid(ctx,canvas);drawTrace(ctx,d.trace,toM);drawRobot(ctx,d.x,d.y,d.heading,toM);
+      drawGrid(ctxEnc,canvasEnc);drawTrace(ctxEnc,d.traceEnc,toCm);drawRobot(ctxEnc,d.encX,d.encY,d.encHeading,toCm);
+    }catch(e){console.log(e)}
+  }
+  setInterval(updateData,200);updateData();
+</script>
+</body>
+</html>
+)rawliteral";
+}
+
+// =====================================================
+// ROUTES WEB
+// =====================================================
+void handleRoot(){
+  server.sendHeader("Cache-Control","no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma","no-cache"); server.sendHeader("Expires","0");
+  server.send(200,"text/html",pageHTML());
+}
+
+void handleData(){
+  float cap=lireCapDeg(); bool capOk=!isnan(cap);
+  if(capOk) capDeg=cap;
+  long g,d; lireEncodeurs(g,d);
+
+  String json="{";
+  json+="\"accelX\":"      +String(accelX_ms2,4)      +",";
+  json+="\"accelY\":"      +String(accelY_ms2,4)      +",";
+  json+="\"accelGlobale\":"+String(accelGlobale_ms2,4)+",";
+  json+="\"vitesseX\":"    +String(vitesseX_ms,4)     +",";
+  json+="\"vitesseY\":"    +String(vitesseY_ms,4)     +",";
+  json+="\"vitesseGlobale\":"+String(vitesseGlobale_ms,4)+",";
+  json+="\"x\":"           +String(posX_m,4)          +",";
+  json+="\"y\":"           +String(posY_m,4)          +",";
+  json+="\"heading\":"     +String(headingDeg,2)      +",";
+  json+="\"encX\":"        +String(posX_enc_cm,3)     +",";
+  json+="\"encY\":"        +String(posY_enc_cm,3)     +",";
+  json+="\"encHeading\":"  +String(theta_enc_deg,3)   +",";
+  json+="\"countG\":"      +String(g)                 +",";
+  json+="\"countD\":"      +String(d)                 +",";
+  json+="\"vitesseCommande\":"+String(vitesseCommande)+",";
+  json+="\"rotAngle\":"    +String(rotAngleCourant,1) +",";
+  json+="\"distTotal\":"  +String(distTotalCm,1)     +",";
+  json+="\"capOk\":"; json+=capOk?"true":"false";
+  if(capOk) json+=",\"cap\":"+String(cap,2);
+
+  json+=",\"trace\":[";
+  for(int i=0;i<traceCount;i++){
+    json+="{\"x\":"+String(traceX[i],4)+",\"y\":"+String(traceY[i],4)+"}";
+    if(i<traceCount-1)json+=",";
+  }
+  json+="],\"traceEnc\":[";
+  for(int i=0;i<traceEncCount;i++){
+    json+="{\"x\":"+String(traceEncX[i],3)+",\"y\":"+String(traceEncY[i],3)+"}";
+    if(i<traceEncCount-1)json+=",";
+  }
+  json+="]}";
+  server.sendHeader("Cache-Control","no-cache, no-store, must-revalidate");
+  server.send(200,"application/json",json);
+}
+
+void handleReset(){
+  stopMoteurs(); etatActuel=STOP; vitesseCommande=0;
+  orientationNordActive=false; sequenceActive=false; rotAngleCourant=0;
+  resetPositionEtVitesses();
+  server.send(200,"text/plain","RESET OK");
+}
+void handleRecalibrerAccel(){
+  stopMoteurs(); etatActuel=STOP; vitesseCommande=0;
+  orientationNordActive=false; robotMoving=false;
+  recalibrerAccelInstant();
+  server.send(200,"text/plain","RECALIBRATION ACCEL OK");
+}
+void handleClearTrace(){
+  clearTrace(); addTracePoint(posX_m,posY_m);
+  clearTraceEncodeurs(); addTracePointEncodeurs(posX_enc_cm,posY_enc_cm);
+  server.send(200,"text/plain","TRACE CLEARED");
+}
+void handleNord(){
+  orientationNordActive=true; etatActuel=STOP; vitesseCommande=0; robotMoving=false;
+  server.send(200,"text/plain","ORIENTATION NORD");
+}
+void handleAvant(){
+  orientationNordActive=false; sequenceActive=false;
+  etatActuel=AVANT; vitesseCommande=min(vitesseCommande+pas,vitesseMax);
+  immobileCounter=0; lastUpdateMicros=micros(); appliquerMouvement();
+  server.send(200,"text/plain","AVANT");
+}
+void handleArriere(){
+  orientationNordActive=false; sequenceActive=false;
+  etatActuel=ARRIERE; vitesseCommande=min(vitesseCommande+pas,vitesseMax);
+  immobileCounter=0; lastUpdateMicros=micros(); appliquerMouvement();
+  server.send(200,"text/plain","ARRIERE");
+}
+void handleGauche(){
+  orientationNordActive=false; sequenceActive=false;
+  etatActuel=GAUCHE; vitesseCommande=min(vitesseCommande+pas,vitesseMax);
+  appliquerMouvement(); server.send(200,"text/plain","GAUCHE");
+}
+void handleDroite(){
+  orientationNordActive=false; sequenceActive=false;
+  etatActuel=DROITE; vitesseCommande=min(vitesseCommande+pas,vitesseMax);
+  appliquerMouvement(); server.send(200,"text/plain","DROITE");
+}
+void handleStop(){
+  orientationNordActive=false; sequenceActive=false;
+  vitesseCommande=0; etatActuel=STOP; appliquerMouvement();
+  vitesseX_ms=vitesseY_ms=vitesseGlobale_ms=0;
+  immobileCounter=0; lastUpdateMicros=micros();
+  server.send(200,"text/plain","STOP");
+}
+void handleSeqParams(){
+  if(server.hasArg("d1")) distSeg1Cm = server.arg("d1").toFloat();
+  if(server.hasArg("d2")) distSeg2Cm = server.arg("d2").toFloat();
+  if(server.hasArg("d3")) distSeg3Cm = server.arg("d3").toFloat();
+  Serial.print("Params : d1="); Serial.print(distSeg1Cm);
+  Serial.print(" d2="); Serial.print(distSeg2Cm);
+  Serial.print(" d3="); Serial.println(distSeg3Cm);
+  server.send(200,"text/plain","OK");
+}
+void handleSequenceEscalier(){
+  stopMoteurs(); orientationNordActive=false; sequenceActive=false;
+  etatActuel=STOP; vitesseCommande=0; robotMoving=false;
+  rotAngleCourant=0; delay(100);
+  sequenceActive=true;
+  executerSequenceEscalier();
+  server.send(200,"text/plain","ESCALIER OK");
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup(){
+  Serial.begin(9600);
+
+  pinMode(EN_D,OUTPUT); pinMode(EN_G,OUTPUT);
+  digitalWrite(EN_D,HIGH); digitalWrite(EN_G,HIGH);
+
+  ledcSetup(0,1000,8); ledcSetup(1,1000,8);
+  ledcSetup(2,1000,8); ledcSetup(3,1000,8);
+  ledcAttachPin(IN_1_D,0); ledcAttachPin(IN_2_D,1);
+  ledcAttachPin(IN_1_G,2); ledcAttachPin(IN_2_G,3);
+
+  pinMode(ENC_G_CH_A,INPUT_PULLUP); pinMode(ENC_G_CH_B,INPUT_PULLUP);
+  pinMode(ENC_D_CH_A,INPUT_PULLUP); pinMode(ENC_D_CH_B,INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A),isrEncG,CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A),isrEncD,CHANGE);
+
+  stopMoteurs();
+  Wire.begin(SDA_PIN,SCL_PIN);
+  initIMU(); initMagnetometre();
+  delay(500);
+
+  calibrerAccel();
+  calibrerGyro();        // ← nouveau : calibration offset gyroscope Z
+  setHeadingReference();
+  resetPositionEtVitesses();
+
+  WiFi.softAP(ssid,password);
+  Serial.print("Adresse : http://"); Serial.println(WiFi.softAPIP());
+
+  server.on("/",                  handleRoot);
+  server.on("/data",              handleData);
+  server.on("/reset",             handleReset);
+  server.on("/cleartrace",        handleClearTrace);
+  server.on("/nord",              handleNord);
+  server.on("/avant",             handleAvant);
+  server.on("/arriere",           handleArriere);
+  server.on("/gauche",            handleGauche);
+  server.on("/droite",            handleDroite);
+  server.on("/stop",              handleStop);
+  server.on("/recalibrer",        handleRecalibrerAccel);
+  server.on("/seqparams",         handleSeqParams);
+  server.on("/sequenceEscalier",  handleSequenceEscalier);
+
+  server.begin();
+  Serial.println("Pret");
+  lastUpdateMicros=micros();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop(){
+  updateHeading();
+  updatePosition();
+  updateOdometryEncodeurs();
+  updateOrientationNord();
+  server.handleClient();
+}
+
