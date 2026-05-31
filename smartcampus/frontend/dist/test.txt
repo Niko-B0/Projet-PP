@@ -1,0 +1,1969 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <esp_system.h>
+#include <math.h>
+
+enum Seq1UpdateResult {
+  SEQ1_RUNNING,
+  SEQ1_DONE,
+  SEQ1_ERROR
+};
+
+extern float robotXcm;
+extern float robotYcm;
+extern float robotThetaRad;
+extern float lineCorrectionHz;
+extern float leftDriveTargetCmS;
+extern float rightDriveTargetCmS;
+extern int lastLeftCommandPWM;
+extern int lastRightCommandPWM;
+
+float angleErrorRad(float target, float current);
+float radToDeg(float rad);
+float degToRad(float deg);
+void driveWheelSpeeds(float leftTargetCmS, float rightTargetCmS);
+void driveLeftMotor(int pwm);
+void driveRightMotor(int pwm);
+void stopMotorsRaw();
+
+// Module sequence 1: controle escalier integre dans ce fichier unique.
+
+namespace {
+
+const float SEQ1_WHEEL_BASE_CM = 9.0f;
+const float SEQ1_PEN_OFFSET_CM = 8.5f;
+const float SEQ1_PEN_SPEED_CM_S = 5.2f;
+const float SEQ1_PEN_SPEED_SLOW_CM_S = 3.8f;
+const float SEQ1_LINE_TOLERANCE_CM = 0.35f;
+const float SEQ1_LATERAL_KP = 0.22f;
+
+const float SEQ1_CORNER_LATERAL_KP = 0.65f;
+const float SEQ1_CORNER_START_CM = 2.0f;
+const float SEQ1_CORNER_SPEED_CM_S = 1.2f;
+
+const float SEQ1_HEADING_KP = 0.48f;
+const float SEQ1_HEADING_KI = 0.0f;
+const float SEQ1_HEADING_KD = 0.012f;
+const float SEQ1_HEADING_LIMIT_RAD_S = 0.85f;
+const float SEQ1_HEADING_INTEGRAL_LIMIT = 1.2f;
+
+const int SEQ1_MOTOR_MIN_PWM = 170;
+const int SEQ1_MAX_PWM = 205;
+const int SEQ1_CORNER_MAX_PWM = 185;
+const int SEQ1_PWM_STEP = 6;
+const float SEQ1_PWM_PER_CM_S = 3.4f;
+
+struct Seq1Pid {
+  float integral;
+  float previousError;
+  bool firstRun;
+};
+
+Seq1Pid seq1HeadingPid = {0.0f, 0.0f, true};
+
+float seq1LineStartXcm = 0.0f;
+float seq1LineStartYcm = 0.0f;
+float seq1LineTargetLengthCm = 0.0f;
+float seq1LineDirectionRad = 0.0f;
+float seq1PreviousLineDirectionRad = 0.0f;
+
+bool seq1HasPreviousLineDirection = false;
+bool seq1LineHasSharpCorner = false;
+bool seq1CornerModeActive = false;
+
+unsigned long seq1LineStartTime = 0;
+unsigned long seq1LineTimeoutMs = 0;
+unsigned long seq1LastLineControlMs = 0;
+unsigned long seq1LastLineDebugPrintMs = 0;
+
+float seq1LineProgressCm = 0.0f;
+float seq1LineLateralErrorCm = 0.0f;
+float seq1LineHeadingErrorDeg = 0.0f;
+
+float seq1PenXcm() {
+  return robotXcm + SEQ1_PEN_OFFSET_CM * cos(robotThetaRad);
+}
+
+float seq1PenYcm() {
+  return robotYcm + SEQ1_PEN_OFFSET_CM * sin(robotThetaRad);
+}
+
+void resetSeq1HeadingPid() {
+  seq1HeadingPid.integral = 0.0f;
+  seq1HeadingPid.previousError = 0.0f;
+  seq1HeadingPid.firstRun = true;
+}
+
+float updateSeq1HeadingPid(float errorRad, float dt) {
+  if (dt <= 0.0f) return 0.0f;
+
+  seq1HeadingPid.integral += errorRad * dt;
+  seq1HeadingPid.integral =
+    constrain(
+      seq1HeadingPid.integral,
+      -SEQ1_HEADING_INTEGRAL_LIMIT,
+      SEQ1_HEADING_INTEGRAL_LIMIT
+    );
+
+  float derivative = 0.0f;
+  if (!seq1HeadingPid.firstRun) {
+    derivative = (errorRad - seq1HeadingPid.previousError) / dt;
+  }
+
+  float output =
+    SEQ1_HEADING_KP * errorRad
+    + SEQ1_HEADING_KI * seq1HeadingPid.integral
+    + SEQ1_HEADING_KD * derivative;
+
+  output =
+    constrain(
+      output,
+      -SEQ1_HEADING_LIMIT_RAD_S,
+      SEQ1_HEADING_LIMIT_RAD_S
+    );
+
+  if ((output >= SEQ1_HEADING_LIMIT_RAD_S && errorRad > 0.0f)
+      || (output <= -SEQ1_HEADING_LIMIT_RAD_S && errorRad < 0.0f)) {
+    seq1HeadingPid.integral -= errorRad * dt;
+  }
+
+  seq1HeadingPid.previousError = errorRad;
+  seq1HeadingPid.firstRun = false;
+
+  return output;
+}
+
+int seq1WheelSpeedToPWM(float speedCmS, bool cornerMode) {
+  if (fabs(speedCmS) < 0.12f) return 0;
+
+  int maxPwm = cornerMode ? SEQ1_CORNER_MAX_PWM : SEQ1_MAX_PWM;
+  int pwm = SEQ1_MOTOR_MIN_PWM + (int)(SEQ1_PWM_PER_CM_S * fabs(speedCmS));
+  pwm = constrain(pwm, SEQ1_MOTOR_MIN_PWM, maxPwm);
+
+  return speedCmS < 0.0f ? -pwm : pwm;
+}
+
+int seq1SmoothPWM(int current, int target) {
+  if (target == 0) return 0;
+
+  if (current == 0) {
+    return target > 0 ? SEQ1_MOTOR_MIN_PWM : -SEQ1_MOTOR_MIN_PWM;
+  }
+
+  if ((current > 0) != (target > 0)) {
+    return 0;
+  }
+
+  if (current < target - SEQ1_PWM_STEP) return current + SEQ1_PWM_STEP;
+  if (current > target + SEQ1_PWM_STEP) return current - SEQ1_PWM_STEP;
+  return target;
+}
+
+void driveSeq1WheelSpeeds(float leftTargetCmS, float rightTargetCmS) {
+  leftDriveTargetCmS = leftTargetCmS;
+  rightDriveTargetCmS = rightTargetCmS;
+
+  int leftTargetPWM =
+    seq1WheelSpeedToPWM(leftTargetCmS, seq1CornerModeActive);
+  int rightTargetPWM =
+    seq1WheelSpeedToPWM(rightTargetCmS, seq1CornerModeActive);
+
+  int leftPWM = seq1SmoothPWM(lastLeftCommandPWM, leftTargetPWM);
+  int rightPWM = seq1SmoothPWM(lastRightCommandPWM, rightTargetPWM);
+
+  lastLeftCommandPWM = leftPWM;
+  lastRightCommandPWM = rightPWM;
+
+  driveLeftMotor(leftPWM);
+  driveRightMotor(rightPWM);
+}
+
+}  // namespace
+
+void resetSeq1Controller() {
+  seq1LineStartXcm = seq1PenXcm();
+  seq1LineStartYcm = seq1PenYcm();
+  seq1LineTargetLengthCm = 0.0f;
+  seq1LineDirectionRad = 0.0f;
+  seq1PreviousLineDirectionRad = 0.0f;
+  seq1HasPreviousLineDirection = false;
+  seq1LineHasSharpCorner = false;
+  seq1CornerModeActive = false;
+  seq1LineStartTime = 0;
+  seq1LineTimeoutMs = 0;
+  seq1LastLineControlMs = 0;
+  seq1LastLineDebugPrintMs = 0;
+  seq1LineProgressCm = 0.0f;
+  seq1LineLateralErrorCm = 0.0f;
+  seq1LineHeadingErrorDeg = 0.0f;
+  resetSeq1HeadingPid();
+}
+
+void startSeq1Line(float distanceCm, float directionDeg, unsigned long timeoutMs) {
+  seq1LineStartXcm = seq1PenXcm();
+  seq1LineStartYcm = seq1PenYcm();
+  seq1LineTargetLengthCm = distanceCm;
+  seq1LineDirectionRad = degToRad(directionDeg);
+
+  float directionChangeDeg = 0.0f;
+  if (seq1HasPreviousLineDirection) {
+    directionChangeDeg =
+      fabs(radToDeg(angleErrorRad(seq1LineDirectionRad, seq1PreviousLineDirectionRad)));
+  }
+
+  seq1LineHasSharpCorner = seq1HasPreviousLineDirection && directionChangeDeg > 45.0f;
+  seq1PreviousLineDirectionRad = seq1LineDirectionRad;
+  seq1HasPreviousLineDirection = true;
+
+  seq1LineStartTime = millis();
+  seq1LineTimeoutMs = timeoutMs;
+  seq1LastLineControlMs = 0;
+  seq1LastLineDebugPrintMs = 0;
+  seq1LineProgressCm = 0.0f;
+  seq1LineLateralErrorCm = 0.0f;
+  seq1LineHeadingErrorDeg = 0.0f;
+  seq1CornerModeActive = false;
+  resetSeq1HeadingPid();
+
+  Serial.print("[SEQ1 LINE] Start line ");
+  Serial.print(distanceCm);
+  Serial.print(" cm at ");
+  Serial.print(directionDeg);
+  Serial.print(" deg | sharpCorner=");
+  Serial.println(seq1LineHasSharpCorner ? "true" : "false");
+}
+
+Seq1UpdateResult updateSeq1Line() {
+  float ux = cos(seq1LineDirectionRad);
+  float uy = sin(seq1LineDirectionRad);
+  float nx = -sin(seq1LineDirectionRad);
+  float ny = cos(seq1LineDirectionRad);
+
+  float dx = seq1PenXcm() - seq1LineStartXcm;
+  float dy = seq1PenYcm() - seq1LineStartYcm;
+
+  seq1LineProgressCm = dx * ux + dy * uy;
+  seq1LineLateralErrorCm = dx * nx + dy * ny;
+  float remainingCm = seq1LineTargetLengthCm - seq1LineProgressCm;
+
+  if (remainingCm <= SEQ1_LINE_TOLERANCE_CM) {
+    stopMotorsRaw();
+    seq1CornerModeActive = false;
+
+    Serial.print("[SEQ1 LINE] Done. Progress = ");
+    Serial.print(seq1LineProgressCm);
+    Serial.print(" cm | lateral error = ");
+    Serial.println(seq1LineLateralErrorCm);
+
+    return SEQ1_DONE;
+  }
+
+  if (millis() - seq1LineStartTime > seq1LineTimeoutMs) {
+    stopMotorsRaw();
+    seq1CornerModeActive = false;
+    Serial.println("[SEQ1 LINE] ERROR: line timeout");
+    return SEQ1_ERROR;
+  }
+
+  unsigned long now = millis();
+  float dt =
+    (seq1LastLineControlMs == 0)
+      ? 0.02f
+      : (now - seq1LastLineControlMs) / 1000.0f;
+  if (dt <= 0.0f || dt > 0.2f) dt = 0.02f;
+  seq1LastLineControlMs = now;
+  lineCorrectionHz = 1.0f / dt;
+
+  float correctedDirectionRad =
+    seq1LineDirectionRad - SEQ1_LATERAL_KP * seq1LineLateralErrorCm;
+  float errorRad = angleErrorRad(correctedDirectionRad, robotThetaRad);
+  float absErrorDeg = fabs(radToDeg(errorRad));
+
+  seq1CornerModeActive =
+    (absErrorDeg > 35.0f && seq1LineProgressCm < SEQ1_CORNER_START_CM)
+    || (seq1LineHasSharpCorner && seq1LineProgressCm < SEQ1_CORNER_START_CM);
+
+  if (seq1CornerModeActive) {
+    correctedDirectionRad =
+      seq1LineDirectionRad - SEQ1_CORNER_LATERAL_KP * seq1LineLateralErrorCm;
+    errorRad = angleErrorRad(correctedDirectionRad, robotThetaRad);
+    errorRad = constrain(errorRad, degToRad(-85.0f), degToRad(85.0f));
+  } else {
+    errorRad = constrain(errorRad, degToRad(-70.0f), degToRad(70.0f));
+  }
+
+  seq1LineHeadingErrorDeg = radToDeg(errorRad);
+
+  float penSpeed = SEQ1_PEN_SPEED_CM_S;
+  if (seq1CornerModeActive) {
+    penSpeed = SEQ1_CORNER_SPEED_CM_S;
+  } else if (remainingCm < 4.0f) {
+    penSpeed = SEQ1_PEN_SPEED_SLOW_CM_S;
+  }
+
+  float vRobot = penSpeed * cos(errorRad);
+  float omegaKinematic = penSpeed * sin(errorRad) / SEQ1_PEN_OFFSET_CM;
+  float omegaPid = updateSeq1HeadingPid(errorRad, dt);
+  float omegaRobot = omegaKinematic + omegaPid;
+
+  if (seq1CornerModeActive) {
+    vRobot *= 0.35f;
+    omegaRobot *= 1.20f;
+  }
+
+  float leftWheelCmS = vRobot - omegaRobot * SEQ1_WHEEL_BASE_CM / 2.0f;
+  float rightWheelCmS = vRobot + omegaRobot * SEQ1_WHEEL_BASE_CM / 2.0f;
+
+  driveSeq1WheelSpeeds(leftWheelCmS, rightWheelCmS);
+
+  if (seq1LastLineDebugPrintMs == 0 || now - seq1LastLineDebugPrintMs >= 150) {
+    seq1LastLineDebugPrintMs = now;
+    Serial.print("[SEQ1 DBG] progress=");
+    Serial.print(seq1LineProgressCm, 2);
+    Serial.print(" lateral=");
+    Serial.print(seq1LineLateralErrorCm, 2);
+    Serial.print(" heading=");
+    Serial.print(seq1LineHeadingErrorDeg, 2);
+    Serial.print(" corner=");
+    Serial.println(seq1CornerModeActive ? "true" : "false");
+  }
+
+  return SEQ1_RUNNING;
+}
+
+float seq1ProgressCm() {
+  return seq1LineProgressCm;
+}
+
+float seq1LateralErrorCm() {
+  return seq1LineLateralErrorCm;
+}
+
+float seq1HeadingErrorDeg() {
+  return seq1LineHeadingErrorDeg;
+}
+
+bool seq1CornerMode() {
+  return seq1CornerModeActive;
+}
+
+
+
+// ============================================================
+// WIFI ACCESS POINT
+// ============================================================
+
+const char* AP_SSID = "DrawBot-ESP32";
+const char* AP_PASSWORD = "drawbot2026";
+
+WebServer server(80);
+
+RTC_DATA_ATTR uint32_t bootCount = 0;
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+
+// ============================================================
+// PINS DRAWBOT
+// ============================================================
+
+#define LEDU1 25
+#define LEDU2 26
+
+#define EN_D 23
+#define EN_G 4
+
+#define IN_1_D 19
+#define IN_2_D 18
+
+#define IN_1_G 17
+#define IN_2_G 16
+
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+#define MPU6050_ADDR 0x68
+
+// ============================================================
+// PWM
+// ============================================================
+
+#define PWM_FREQ 20000
+#define PWM_RESOLUTION 8
+
+#define CH_D_IN1 0
+#define CH_D_IN2 1
+#define CH_G_IN1 2
+#define CH_G_IN2 3
+
+const bool INVERT_RIGHT_MOTOR = true;
+const bool INVERT_LEFT_MOTOR = false;
+
+const bool INVERT_LEFT_ENCODER = false;
+const bool INVERT_RIGHT_ENCODER = true;
+const bool INVERT_GYRO_Z = false;
+
+// ============================================================
+// PARAMETRES GEOMETRIQUES / CALIBRATION
+// ============================================================
+
+const float TIK_PAR_TOUR = 700.0f;
+
+const float DIAMETRE = 9.0f;
+const float CIRCONFERENCE = PI * DIAMETRE;
+
+// Distance entre les roues.
+const float ECART_ROUES = 8.2f;
+const float ECART_ROUES_CERCLE = ECART_ROUES;
+
+// Distance axe des roues -> stylo.
+const float ECART_STYLO = 13.0f;
+
+// Valeur validÃ©e dans ton ancien code.
+const float CORRECTION = 0.1762f;
+
+// ============================================================
+// REGLAGES MOTEURS / TRAJECTOIRE STYLO
+// ============================================================
+
+// Ton robot ne bouge pas sous environ 170 PWM.
+const int VALEUR_MIN_MOTEUR = 170;
+
+// Vitesse manuelle par dÃ©faut.
+int manualSpeed = 210;
+const int MANUAL_MIN_PWM = 190;
+const int MANUAL_TURN_BOOST_PWM = 30;
+
+float circleRadiusUserCm = 15.0f;
+const float CIRCLE_MIN_RADIUS_CM = ECART_STYLO;
+const float CIRCLE_MAX_RADIUS_CM = 100.0f;
+const float CIRCLE_MIN_MOVING_WHEEL_CM_S = 3.8f;
+const float CIRCLE_INNER_TARGET_SCALE = 0.70f;
+const float CIRCLE_MAX_WHEEL_CM_S = 16.0f;
+const float CIRCLE_CLOSURE_TOLERANCE_CM = 2.5f;
+const float CIRCLE_FORCE_EXTRA_DEG = 180.0f;
+const float CIRCLE_MAX_DELTA_DEG = 18.0f;
+
+// Version Ã©quilibrÃ©e : assez lente, mais assez Ã©nergique pour prendre l'angle.
+const float VITESSE_STYLO = 5.2f;
+const float VITESSE_MIN_STYLO = 3.8f;
+
+// Conversion vitesse roue -> PWM.
+const float PWM_PAR_CM_S = 3.4f;
+
+// Correction latÃ©rale.
+// Si l'angle est trop mou : 0.25f.
+// Si Ã§a vague trop : 0.18f.
+const float KP_LINE_LATERAL = 0.18f;
+const float LINE_SLOW_HEADING_ERROR_DEG = 18.0f;
+const float LINE_TURN_IN_PLACE_ERROR_DEG = 45.0f;
+
+// TolÃ©rance de fin de ligne.
+const float VALEUR_FIN_DE_LIGNE = 0.35f;
+
+// SÃ©curitÃ©s.
+const unsigned long ARRET_SEQUENCE_TIMEOUT = 60000;
+const unsigned long STOP_ENTRE_ACTION = 250;
+
+const unsigned long FREQUENCE_RAFRAICHISSEMENT_POSITION_MS = 20;
+const unsigned long ARRET_SI_AUCUNE_COMMANDE_MS = 800;
+
+const unsigned long FREQUENCE_IMU_US = 5000;
+const unsigned long STATUS_REFRESH_IDLE_MS = 600;
+const unsigned long STATUS_REFRESH_SEQUENCE_MS = 800;
+const unsigned long STATUS_REFRESH_ERROR_MS = 1500;
+
+const float WHEEL_TARGET_ACCEL_CM_S2 = 18.0f;
+const float WHEEL_PID_CORRECTION_LIMIT_PWM = 80.0f;
+const float WHEEL_INTEGRAL_DECAY = 0.985f;
+const int WHEEL_PWM_STEP_MAX = 8;
+
+// Les deux constantes principales a regler pour le PID vitesse des roues :
+// - WHEEL_SPEED_KP : reaction immediate a l'erreur.
+// - WHEEL_SPEED_KI : correction persistante quand la roue reste trop rapide/lente.
+const float WHEEL_SPEED_KP = 6.0f;
+const float WHEEL_SPEED_KI = 9.0f;
+const float WHEEL_SPEED_KD = 0.12f;
+
+const float CIRCLE_SPEED_KP = 4.8f;
+const float CIRCLE_SPEED_KI = 2.6f;
+const float CIRCLE_SPEED_FILTER_ALPHA = 0.28f;
+const float CIRCLE_SPEED_INTEGRAL_LIMIT = 9.0f;
+const float CIRCLE_TARGET_ACCEL_CM_S2 = 12.0f;
+const float CIRCLE_PWM_PER_CM_S = 3.2f;
+const float CIRCLE_PID_CORRECTION_LIMIT_PWM = 42.0f;
+const int CIRCLE_MIN_PWM = 178;
+const int CIRCLE_MAX_PWM = 218;
+const int CIRCLE_PWM_STEP_MAX = 3;
+
+// ============================================================
+// PID
+// ============================================================
+
+struct PIDController {
+  float kp;
+  float ki;
+  float kd;
+  float integral;
+  float previousError;
+  float outputMin;
+  float outputMax;
+  bool firstRun;
+};
+
+struct WheelSpeedPID {
+  float kp;
+  float ki;
+  float kd;
+  float integral;
+  float previousError;
+  float derivativeFiltered;
+  float integralLimit;
+  float derivativeAlpha;
+  bool firstRun;
+};
+
+void resetPID(PIDController& pid) {
+  pid.integral = 0.0f;
+  pid.previousError = 0.0f;
+  pid.firstRun = true;
+}
+
+void resetWheelSpeedPID(WheelSpeedPID& pid) {
+  pid.integral = 0.0f;
+  pid.previousError = 0.0f;
+  pid.derivativeFiltered = 0.0f;
+  pid.firstRun = true;
+}
+
+float updatePID(PIDController& pid, float error, float dt) {
+  if (dt <= 0.0f) return 0.0f;
+
+  pid.integral += error * dt;
+
+  float derivative = 0.0f;
+  if (!pid.firstRun) {
+    derivative = (error - pid.previousError) / dt;
+  }
+
+  float output =
+    pid.kp * error
+    + pid.ki * pid.integral
+    + pid.kd * derivative;
+
+  output = constrain(output, pid.outputMin, pid.outputMax);
+
+  if ((output == pid.outputMin && error < 0.0f)
+      || (output == pid.outputMax && error > 0.0f)) {
+    pid.integral -= error * dt;
+  }
+
+  pid.previousError = error;
+  pid.firstRun = false;
+
+  return output;
+}
+
+int applyPWMDeadband(float rawPwm, float targetCmS, float measuredCmS) {
+  rawPwm = constrain(rawPwm, -255.0f, 255.0f);
+
+  if (fabs(rawPwm) < 1.0f) return 0;
+
+  int pwmSign = (rawPwm > 0.0f) ? 1 : -1;
+  float absPwm = fabs(rawPwm);
+
+  if (absPwm >= VALEUR_MIN_MOTEUR) {
+    return pwmSign * (int)absPwm;
+  }
+
+  if (fabs(targetCmS) < 0.12f) {
+    if (fabs(measuredCmS) > 0.8f && absPwm > 25.0f) {
+      return pwmSign * VALEUR_MIN_MOTEUR;
+    }
+    return 0;
+  }
+
+  bool targetDirection = targetCmS > 0.0f;
+  bool pwmSameDirectionAsTarget =
+    (targetDirection && rawPwm > 0.0f)
+    || (!targetDirection && rawPwm < 0.0f);
+
+  bool wheelTooSlow =
+    (targetDirection && measuredCmS < targetCmS)
+    || (!targetDirection && measuredCmS > targetCmS);
+
+  if (pwmSameDirectionAsTarget) {
+    return wheelTooSlow ? pwmSign * VALEUR_MIN_MOTEUR : 0;
+  }
+
+  // Si la roue est trop rapide, on autorise un vrai freinage actif.
+  if (!wheelTooSlow && absPwm > 20.0f) {
+    return pwmSign * VALEUR_MIN_MOTEUR;
+  }
+
+  return 0;
+}
+
+int updateWheelSpeedPID(
+  WheelSpeedPID& pid,
+  float targetCmS,
+  float measuredCmS,
+  float dt
+) {
+  if (dt <= 0.0f) return 0;
+
+  float error = targetCmS - measuredCmS;
+
+  if (!pid.firstRun && error * pid.previousError < 0.0f) {
+    pid.integral *= 0.25f;
+  }
+
+  pid.integral *= WHEEL_INTEGRAL_DECAY;
+  pid.integral += error * dt;
+  pid.integral =
+    constrain(pid.integral, -pid.integralLimit, pid.integralLimit);
+
+  float derivative = 0.0f;
+  if (!pid.firstRun) {
+    derivative = (error - pid.previousError) / dt;
+  }
+
+  pid.derivativeFiltered =
+    pid.derivativeAlpha * derivative
+    + (1.0f - pid.derivativeAlpha) * pid.derivativeFiltered;
+
+  float feedbackPWM =
+    pid.kp * error
+    + pid.ki * pid.integral
+    + pid.kd * pid.derivativeFiltered;
+
+  feedbackPWM =
+    constrain(
+      feedbackPWM,
+      -WHEEL_PID_CORRECTION_LIMIT_PWM,
+      WHEEL_PID_CORRECTION_LIMIT_PWM
+    );
+
+  float feedForwardPWM = 0.0f;
+  if (fabs(targetCmS) >= 0.12f) {
+    float sign = (targetCmS > 0.0f) ? 1.0f : -1.0f;
+    feedForwardPWM =
+      sign * (VALEUR_MIN_MOTEUR + PWM_PAR_CM_S * fabs(targetCmS));
+  }
+
+  float rawPWM = feedForwardPWM + feedbackPWM;
+
+  if ((rawPWM > 255.0f && error > 0.0f)
+      || (rawPWM < -255.0f && error < 0.0f)) {
+    pid.integral -= error * dt;
+  }
+
+  pid.previousError = error;
+  pid.firstRun = false;
+
+  return applyPWMDeadband(rawPWM, targetCmS, measuredCmS);
+}
+
+WheelSpeedPID leftSpeedPID = {WHEEL_SPEED_KP, WHEEL_SPEED_KI, WHEEL_SPEED_KD, 0.0f, 0.0f, 0.0f, 12.0f, 0.25f, true};
+WheelSpeedPID rightSpeedPID = {WHEEL_SPEED_KP, WHEEL_SPEED_KI, WHEEL_SPEED_KD, 0.0f, 0.0f, 0.0f, 12.0f, 0.25f, true};
+PIDController headingPID = {3.2f, 0.0f, 0.12f, 0.0f, 0.0f, -2.2f, 2.2f, true};
+PIDController distancePID = {1.0f, 0.0f, 0.05f, 0.0f, 0.0f, -7.0f, 7.0f, true};
+PIDController turnPID = {3.6f, 0.02f, 0.18f, 0.0f, 0.0f, -2.0f, 2.0f, true};
+
+// ============================================================
+// ETAT ROBOT
+// ============================================================
+
+String currentCommand = "STOP";
+unsigned long lastManualCommandTime = 0;
+
+bool isManualCommandActive() {
+  return currentCommand == "MANUAL_FORWARD"
+    || currentCommand == "MANUAL_BACKWARD"
+    || currentCommand == "MANUAL_LEFT"
+    || currentCommand == "MANUAL_RIGHT";
+}
+
+const char* resetReasonText(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXTERNAL";
+    case ESP_RST_SW: return "SOFTWARE";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
+}
+
+// ============================================================
+// ENCODEURS
+// ============================================================
+
+volatile long encoderLeftTicks = 0;
+volatile long encoderRightTicks = 0;
+
+volatile uint8_t lastLeftState = 0;
+volatile uint8_t lastRightState = 0;
+
+long lastEncoderLeftTicks = 0;
+long lastEncoderRightTicks = 0;
+
+unsigned long lastOdometryTime = 0;
+
+float leftTicksPerSecond = 0.0f;
+float rightTicksPerSecond = 0.0f;
+
+float leftRPM = 0.0f;
+float rightRPM = 0.0f;
+
+float leftWheelSpeedCmS = 0.0f;
+float rightWheelSpeedCmS = 0.0f;
+float leftDriveTargetCmS = 0.0f;
+float rightDriveTargetCmS = 0.0f;
+int lastLeftCommandPWM = 0;
+int lastRightCommandPWM = 0;
+
+float odometryUpdateHz = 0.0f;
+float imuUpdateHz = 0.0f;
+float driveCorrectionHz = 0.0f;
+float lineCorrectionHz = 0.0f;
+float turnCorrectionHz = 0.0f;
+
+int8_t QUAD_TABLE[16] = {
+  0, -1,  1,  0,
+  1,  0,  0, -1,
+ -1,  0,  0,  1,
+  0,  1, -1,  0
+};
+
+// ============================================================
+// ODOMETRIE ROBOT + STYLO
+// ============================================================
+
+float robotXcm = 0.0f;
+float robotYcm = 0.0f;
+float robotThetaRad = 0.0f;
+
+float penXcm = ECART_STYLO;
+float penYcm = 0.0f;
+
+// ============================================================
+// GYROSCOPE MPU6050
+// ============================================================
+
+bool imuReady = false;
+float gyroZOffsetDps = 0.0f;
+float gyroHeadingRad = 0.0f;
+unsigned long lastImuUpdateUs = 0;
+
+// ============================================================
+// OUTILS MATHS
+// ============================================================
+
+float normalizeAngleRad(float angle) {
+  while (angle > PI) angle -= 2.0f * PI;
+  while (angle < -PI) angle += 2.0f * PI;
+  return angle;
+}
+
+float angleErrorRad(float target, float current) {
+  return normalizeAngleRad(target - current);
+}
+
+float radToDeg(float rad) {
+  return rad * 180.0f / PI;
+}
+
+float degToRad(float deg) {
+  return deg * PI / 180.0f;
+}
+
+float approachValue(float current, float target, float maxStep) {
+  if (current < target - maxStep) return current + maxStep;
+  if (current > target + maxStep) return current - maxStep;
+  return target;
+}
+
+int approachPWM(int current, int target, int maxStep) {
+  if (current < target - maxStep) return current + maxStep;
+  if (current > target + maxStep) return current - maxStep;
+  return target;
+}
+
+float ticksToCm(long ticks) {
+  return ((float)ticks / TIK_PAR_TOUR) * CIRCONFERENCE * CORRECTION;
+}
+
+float robotHeadingRad() {
+  return imuReady ? gyroHeadingRad : robotThetaRad;
+}
+
+void resetMotionControlTiming();
+
+// ============================================================
+// MPU6050
+// ============================================================
+
+bool writeMpuRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+int16_t readMpuWord(uint8_t reg) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return 0;
+
+  if (Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)2) != 2) return 0;
+
+  int16_t high = Wire.read();
+  int16_t low = Wire.read();
+  return (high << 8) | low;
+}
+
+float readGyroZDps() {
+  int16_t rawZ = readMpuWord(0x47);
+  float gyroZDps = ((float)rawZ / 131.0f) - gyroZOffsetDps;
+  return INVERT_GYRO_Z ? -gyroZDps : gyroZDps;
+}
+
+void setupImu() {
+  Wire.begin();
+  Wire.setClock(400000);
+
+  if (!writeMpuRegister(0x6B, 0x00)) {
+    imuReady = false;
+    Serial.println("[IMU] MPU6050 non detecte. Fallback odometrie encodeurs.");
+    return;
+  }
+
+  writeMpuRegister(0x1B, 0x00);
+  writeMpuRegister(0x1A, 0x03);
+
+  delay(120);
+
+  const int samples = 600;
+  float sum = 0.0f;
+
+  for (int i = 0; i < samples; i++) {
+    int16_t rawZ = readMpuWord(0x47);
+    sum += (float)rawZ / 131.0f;
+    delay(2);
+  }
+
+  gyroZOffsetDps = sum / samples;
+  gyroHeadingRad = 0.0f;
+  lastImuUpdateUs = micros();
+  imuReady = true;
+
+  Serial.print("[IMU] MPU6050 pret. Offset gyro Z = ");
+  Serial.print(gyroZOffsetDps, 4);
+  Serial.println(" dps");
+}
+
+void updateImu() {
+  if (!imuReady) return;
+
+  unsigned long nowUs = micros();
+  unsigned long dtUs = nowUs - lastImuUpdateUs;
+
+  if (dtUs < FREQUENCE_IMU_US) return;
+
+  float dt = dtUs / 1000000.0f;
+  float gyroZDps = readGyroZDps();
+  imuUpdateHz = 1.0f / dt;
+
+  gyroHeadingRad = normalizeAngleRad(
+    gyroHeadingRad + degToRad(gyroZDps) * dt
+  );
+
+  lastImuUpdateUs = nowUs;
+}
+
+// ============================================================
+// LECTURE ENCODEURS
+// ============================================================
+
+uint8_t readLeftEncoderState() {
+  uint8_t a = digitalRead(ENC_G_CH_A);
+  uint8_t b = digitalRead(ENC_G_CH_B);
+  return (a << 1) | b;
+}
+
+uint8_t readRightEncoderState() {
+  uint8_t a = digitalRead(ENC_D_CH_A);
+  uint8_t b = digitalRead(ENC_D_CH_B);
+  return (a << 1) | b;
+}
+
+void IRAM_ATTR updateLeftEncoder() {
+  uint8_t newState = readLeftEncoderState();
+  uint8_t index = (lastLeftState << 2) | newState;
+  int8_t movement = QUAD_TABLE[index];
+
+  if (INVERT_LEFT_ENCODER) movement = -movement;
+
+  encoderLeftTicks += movement;
+  lastLeftState = newState;
+}
+
+void IRAM_ATTR updateRightEncoder() {
+  uint8_t newState = readRightEncoderState();
+  uint8_t index = (lastRightState << 2) | newState;
+  int8_t movement = QUAD_TABLE[index];
+
+  if (INVERT_RIGHT_ENCODER) movement = -movement;
+
+  encoderRightTicks += movement;
+  lastRightState = newState;
+}
+
+// ============================================================
+// MOTEURS
+// ============================================================
+
+void setupMotors() {
+  pinMode(EN_D, OUTPUT);
+  pinMode(EN_G, OUTPUT);
+
+  digitalWrite(EN_D, HIGH);
+  digitalWrite(EN_G, HIGH);
+
+  ledcSetup(CH_D_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_D_IN2, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_G_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_G_IN2, PWM_FREQ, PWM_RESOLUTION);
+
+  ledcAttachPin(IN_1_D, CH_D_IN1);
+  ledcAttachPin(IN_2_D, CH_D_IN2);
+  ledcAttachPin(IN_1_G, CH_G_IN1);
+  ledcAttachPin(IN_2_G, CH_G_IN2);
+
+  ledcWrite(CH_D_IN1, 0);
+  ledcWrite(CH_D_IN2, 0);
+  ledcWrite(CH_G_IN1, 0);
+  ledcWrite(CH_G_IN2, 0);
+}
+
+void driveRightMotor(int pwm) {
+  pwm = constrain(pwm, -255, 255);
+
+  if (INVERT_RIGHT_MOTOR) pwm = -pwm;
+
+  if (pwm > 0) {
+    ledcWrite(CH_D_IN1, pwm);
+    ledcWrite(CH_D_IN2, 0);
+  } else if (pwm < 0) {
+    ledcWrite(CH_D_IN1, 0);
+    ledcWrite(CH_D_IN2, -pwm);
+  } else {
+    ledcWrite(CH_D_IN1, 0);
+    ledcWrite(CH_D_IN2, 0);
+  }
+}
+
+void driveLeftMotor(int pwm) {
+  pwm = constrain(pwm, -255, 255);
+
+  if (INVERT_LEFT_MOTOR) pwm = -pwm;
+
+  if (pwm > 0) {
+    ledcWrite(CH_G_IN1, pwm);
+    ledcWrite(CH_G_IN2, 0);
+  } else if (pwm < 0) {
+    ledcWrite(CH_G_IN1, 0);
+    ledcWrite(CH_G_IN2, -pwm);
+  } else {
+    ledcWrite(CH_G_IN1, 0);
+    ledcWrite(CH_G_IN2, 0);
+  }
+}
+
+void stopMotorsRaw() {
+  driveRightMotor(0);
+  driveLeftMotor(0);
+  leftDriveTargetCmS = 0.0f;
+  rightDriveTargetCmS = 0.0f;
+  lastLeftCommandPWM = 0;
+  lastRightCommandPWM = 0;
+  resetMotionControlTiming();
+  resetWheelSpeedPID(leftSpeedPID);
+  resetWheelSpeedPID(rightSpeedPID);
+}
+
+void stopRobot() {
+  stopMotorsRaw();
+  currentCommand = "STOP";
+}
+
+// ============================================================
+// COMMANDES MANUELLES
+// ============================================================
+
+int effectiveManualPWM(int requestedPwm, bool turning) {
+  requestedPwm = constrain(requestedPwm, 0, 255);
+  if (requestedPwm == 0) return 0;
+
+  int pwm = max(requestedPwm, MANUAL_MIN_PWM);
+  if (turning) {
+    pwm = min(255, pwm + MANUAL_TURN_BOOST_PWM);
+  }
+
+  return pwm;
+}
+
+void manualDriveRaw(int leftPwm, int rightPwm) {
+  leftDriveTargetCmS = 0.0f;
+  rightDriveTargetCmS = 0.0f;
+  resetWheelSpeedPID(leftSpeedPID);
+  resetWheelSpeedPID(rightSpeedPID);
+
+  lastLeftCommandPWM = leftPwm;
+  lastRightCommandPWM = rightPwm;
+
+  driveLeftMotor(leftPwm);
+  driveRightMotor(rightPwm);
+}
+
+void moveForwardManual() {
+  int pwm = effectiveManualPWM(manualSpeed, false);
+  manualDriveRaw(pwm, pwm);
+  currentCommand = "MANUAL_FORWARD";
+  lastManualCommandTime = millis();
+}
+
+void moveBackwardManual() {
+  int pwm = effectiveManualPWM(manualSpeed, false);
+  manualDriveRaw(-pwm, -pwm);
+  currentCommand = "MANUAL_BACKWARD";
+  lastManualCommandTime = millis();
+}
+
+void turnLeftManual() {
+  int pwm = effectiveManualPWM(manualSpeed, true);
+  manualDriveRaw(-pwm, pwm);
+  currentCommand = "MANUAL_LEFT";
+  lastManualCommandTime = millis();
+}
+
+void turnRightManual() {
+  int pwm = effectiveManualPWM(manualSpeed, true);
+  manualDriveRaw(pwm, -pwm);
+  currentCommand = "MANUAL_RIGHT";
+  lastManualCommandTime = millis();
+}
+
+// ============================================================
+// ODOMETRIE
+// ============================================================
+
+void updatePenPosition() {
+  penXcm = robotXcm + ECART_STYLO * cos(robotThetaRad);
+  penYcm = robotYcm + ECART_STYLO * sin(robotThetaRad);
+}
+
+void resetOdometry() {
+  noInterrupts();
+  encoderLeftTicks = 0;
+  encoderRightTicks = 0;
+  interrupts();
+
+  lastEncoderLeftTicks = 0;
+  lastEncoderRightTicks = 0;
+
+  robotXcm = 0.0f;
+  robotYcm = 0.0f;
+  robotThetaRad = 0.0f;
+  gyroHeadingRad = 0.0f;
+  lastImuUpdateUs = micros();
+
+  leftTicksPerSecond = 0.0f;
+  rightTicksPerSecond = 0.0f;
+  leftRPM = 0.0f;
+  rightRPM = 0.0f;
+  leftWheelSpeedCmS = 0.0f;
+  rightWheelSpeedCmS = 0.0f;
+  leftDriveTargetCmS = 0.0f;
+  rightDriveTargetCmS = 0.0f;
+  lastLeftCommandPWM = 0;
+  lastRightCommandPWM = 0;
+
+  resetWheelSpeedPID(leftSpeedPID);
+  resetWheelSpeedPID(rightSpeedPID);
+  resetPID(headingPID);
+  resetPID(distancePID);
+  resetPID(turnPID);
+
+  updatePenPosition();
+
+  lastOdometryTime = millis();
+
+  Serial.println("[ODOM] Reset.");
+}
+
+void setupEncoders() {
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  pinMode(ENC_G_CH_B, INPUT_PULLUP);
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  pinMode(ENC_D_CH_B, INPUT_PULLUP);
+
+  lastLeftState = readLeftEncoderState();
+  lastRightState = readRightEncoderState();
+
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), updateLeftEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_B), updateLeftEncoder, CHANGE);
+
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), updateRightEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_B), updateRightEncoder, CHANGE);
+
+  lastOdometryTime = millis();
+
+  Serial.println("[ENC] Encodeurs initialises.");
+}
+
+void updateOdometry() {
+  unsigned long now = millis();
+  unsigned long dtMs = now - lastOdometryTime;
+
+  if (dtMs < FREQUENCE_RAFRAICHISSEMENT_POSITION_MS) return;
+
+  noInterrupts();
+  long leftNow = encoderLeftTicks;
+  long rightNow = encoderRightTicks;
+  interrupts();
+
+  long deltaLeftTicks = leftNow - lastEncoderLeftTicks;
+  long deltaRightTicks = rightNow - lastEncoderRightTicks;
+
+  float dt = dtMs / 1000.0f;
+  odometryUpdateHz = 1.0f / dt;
+
+  leftTicksPerSecond = deltaLeftTicks / dt;
+  rightTicksPerSecond = deltaRightTicks / dt;
+
+  leftRPM = (leftTicksPerSecond / TIK_PAR_TOUR) * 60.0f;
+  rightRPM = (rightTicksPerSecond / TIK_PAR_TOUR) * 60.0f;
+
+  float deltaLeftCm = ticksToCm(deltaLeftTicks);
+  float deltaRightCm = ticksToCm(deltaRightTicks);
+
+  leftWheelSpeedCmS = deltaLeftCm / dt;
+  rightWheelSpeedCmS = deltaRightCm / dt;
+
+  float deltaS = (deltaRightCm + deltaLeftCm) / 2.0f;
+  float deltaTheta = (deltaRightCm - deltaLeftCm) / ECART_ROUES;
+
+  float previousTheta = robotThetaRad;
+  float encoderTheta = normalizeAngleRad(robotThetaRad + deltaTheta);
+
+  if (imuReady) {
+    robotThetaRad = gyroHeadingRad;
+  } else {
+    robotThetaRad = encoderTheta;
+  }
+
+  float thetaMid = previousTheta + normalizeAngleRad(robotThetaRad - previousTheta) / 2.0f;
+
+  robotXcm += deltaS * cos(thetaMid);
+  robotYcm += deltaS * sin(thetaMid);
+
+  updatePenPosition();
+
+  lastEncoderLeftTicks = leftNow;
+  lastEncoderRightTicks = rightNow;
+  lastOdometryTime = now;
+}
+
+// ============================================================
+// SEQUENCES : TRAJECTOIRE DU STYLO
+// ============================================================
+
+enum ActionType {
+  ACTION_DRAW_LINE,
+  ACTION_TURN_ANGLE,
+  ACTION_DRAW_CIRCLE,
+  ACTION_END
+};
+
+struct SequenceAction {
+  ActionType type;
+
+  // Ligne
+  float distanceCm;
+  float directionDeg;
+
+  // Cercle
+  float radiusCm;
+  int turns;
+
+  const char* label;
+  unsigned long timeoutMs;
+};
+
+// Sequence 1 : escalier. La trajectoire vient du module seq1.cpp.
+const SequenceAction SEQUENCE_1[] = {
+
+  {
+    ACTION_DRAW_LINE,
+    20.0f,                         // distanceCm
+    0.0f,                          // directionDeg
+    0.0f,                          // radiusCm
+    0,                             // turns
+    "line_20_forward",
+    ARRET_SEQUENCE_TIMEOUT
+  },
+
+  {
+    ACTION_DRAW_LINE,
+    10.0f,
+    90.0f,
+    0.0f,
+    0,
+    "line_10_left",
+    ARRET_SEQUENCE_TIMEOUT
+  },
+
+  {
+    ACTION_DRAW_LINE,
+    40.0f,
+    0.0f,
+    0.0f,
+    0,
+    "line_40_forward",
+    ARRET_SEQUENCE_TIMEOUT
+  },
+
+  {
+    ACTION_END,
+    0.0f,
+    0.0f,
+    0.0f,
+    0,
+    "done",
+    0
+  }
+};
+
+SequenceAction SEQUENCE_2[] = {
+
+  {
+    ACTION_DRAW_CIRCLE,
+    0.0f,
+    0.0f,
+    15.0f,
+    1,
+    "circle_dynamic",
+    90000
+  },
+
+  {
+    ACTION_END,
+    0.0f,
+    0.0f,
+    0.0f,
+    0,
+    "done",
+    0
+  }
+};
+
+const SequenceAction SEQUENCE_3_PLACEHOLDER[] = {
+
+  {
+    ACTION_END,
+    0.0f,
+    0.0f,
+    0.0f,
+    0,
+    "seq3_not_implemented_yet",
+    0
+  }
+
+};
+
+enum MotionType {
+  MOTION_NONE,
+  MOTION_DRAW_LINE,
+  MOTION_TURN_ANGLE,
+  MOTION_DRAW_CIRCLE
+};
+
+bool sequenceActive = false;
+bool sequenceDone = false;
+bool sequenceError = false;
+
+int activeSequenceId = 0;
+const SequenceAction* activeSequence = nullptr;
+int activeActionIndex = 0;
+
+MotionType activeMotion = MOTION_NONE;
+
+bool waitingBetweenActions = false;
+unsigned long actionPauseStartTime = 0;
+
+String sequenceStatus = "IDLE";
+String currentActionLabel = "none";
+
+// ============================================================
+// VARIABLES LIGNE STYLO
+// ============================================================
+
+float lineStartXcm = 0.0f;
+float lineStartYcm = 0.0f;
+
+float lineTargetLengthCm = 0.0f;
+float lineDirectionRad = 0.0f;
+long lineStartLeftTicks = 0;
+long lineStartRightTicks = 0;
+
+unsigned long lineStartTime = 0;
+unsigned long lineTimeoutMs = 0;
+
+// ============================================================
+// VARIABLES ROTATION GYRO
+// ============================================================
+
+float turnTargetHeadingRad = 0.0f;
+unsigned long turnStartTime = 0;
+unsigned long turnTimeoutMs = 0;
+
+// ============================================================
+// VARIABLES CERCLE STYLO
+// ============================================================
+
+float circleRadiusCm = 0.0f;
+float circleRobotRadiusCm = 0.0f;
+float circleCenterXcm = 0.0f;
+float circleCenterYcm = 0.0f;
+float circleTurnDirection = 1.0f;
+float circleLeftTargetCmS = 0.0f;
+float circleRightTargetCmS = 0.0f;
+float circleLeftCommandCmS = 0.0f;
+float circleRightCommandCmS = 0.0f;
+float circleInnerWheelRadiusCm = 0.0f;
+float circleOuterWheelRadiusCm = 0.0f;
+float circleAdaptiveScale = 1.0f;
+
+float circleStartAngleRad = 0.0f;
+float circleTargetAngleRad = 0.0f;
+
+float accumulatedCircleAngle = 0.0f;
+float lastCircleAngle = 0.0f;
+float circleStartPenXcm = 0.0f;
+float circleStartPenYcm = 0.0f;
+float circleProgressDeg = 0.0f;
+float circleClosureErrorCm = 0.0f;
+
+unsigned long circleStartTime = 0;
+unsigned long circleTimeoutMs = 0;
+
+float circleLeftIntegral = 0.0f;
+float circleRightIntegral = 0.0f;
+float circleLeftFilteredCmS = 0.0f;
+float circleRightFilteredCmS = 0.0f;
+int circleLeftPWM = 0;
+int circleRightPWM = 0;
+unsigned long lastCircleSpeedControlMs = 0;
+
+unsigned long lastDriveControlMs = 0;
+unsigned long lastLineControlMs = 0;
+unsigned long lastTurnControlMs = 0;
+
+void resetMotionControlTiming() {
+  lastDriveControlMs = 0;
+  lastLineControlMs = 0;
+  lastTurnControlMs = 0;
+}
+
+void resetCircleSpeedController() {
+  circleLeftIntegral = 0.0f;
+  circleRightIntegral = 0.0f;
+  circleLeftFilteredCmS = 0.0f;
+  circleRightFilteredCmS = 0.0f;
+  circleLeftPWM = 0;
+  circleRightPWM = 0;
+  circleLeftCommandCmS = 0.0f;
+  circleRightCommandCmS = 0.0f;
+  lastCircleSpeedControlMs = 0;
+}
+
+// ============================================================
+// CONVERSION VITESSE ROUE -> PWM
+// ============================================================
+
+int wheelSpeedToPWM(float speedCmS) {
+  if (fabs(speedCmS) < 0.12f) return 0;
+
+  int pwm = VALEUR_MIN_MOTEUR + (int)(PWM_PAR_CM_S * fabs(speedCmS));
+
+  // Compromis : assez fort pour tourner franchement, pas trop pour Ã©viter les vagues.
+  pwm = constrain(pwm, VALEUR_MIN_MOTEUR, 205);
+
+  if (speedCmS < 0.0f) pwm = -pwm;
+
+  return pwm;
+}
+
+void driveWheelSpeeds(float leftTargetCmS, float rightTargetCmS) {
+  unsigned long now = millis();
+
+  float dt = (lastDriveControlMs == 0) ? 0.02f : (now - lastDriveControlMs) / 1000.0f;
+  if (dt <= 0.0f || dt > 0.2f) dt = 0.02f;
+  lastDriveControlMs = now;
+  driveCorrectionHz = 1.0f / dt;
+
+  if (fabs(leftTargetCmS) < 0.12f && fabs(rightTargetCmS) < 0.12f) {
+    stopMotorsRaw();
+    return;
+  }
+
+  float maxTargetStep = WHEEL_TARGET_ACCEL_CM_S2 * dt;
+  leftDriveTargetCmS =
+    approachValue(leftDriveTargetCmS, leftTargetCmS, maxTargetStep);
+  rightDriveTargetCmS =
+    approachValue(rightDriveTargetCmS, rightTargetCmS, maxTargetStep);
+
+  int leftPWMTarget =
+    updateWheelSpeedPID(
+      leftSpeedPID,
+      leftDriveTargetCmS,
+      leftWheelSpeedCmS,
+      dt
+    );
+
+  int rightPWMTarget =
+    updateWheelSpeedPID(
+      rightSpeedPID,
+      rightDriveTargetCmS,
+      rightWheelSpeedCmS,
+      dt
+    );
+
+  int leftPWM =
+    approachPWM(lastLeftCommandPWM, leftPWMTarget, WHEEL_PWM_STEP_MAX);
+  int rightPWM =
+    approachPWM(lastRightCommandPWM, rightPWMTarget, WHEEL_PWM_STEP_MAX);
+
+  lastLeftCommandPWM = leftPWM;
+  lastRightCommandPWM = rightPWM;
+
+  driveLeftMotor(leftPWM);
+  driveRightMotor(rightPWM);
+}
+
+int circleSpeedToPWM(
+  float targetCmS,
+  float measuredCmS,
+  float& filteredCmS,
+  float& integral,
+  float dt
+) {
+  if (fabs(targetCmS) < 0.12f) {
+    integral = 0.0f;
+    filteredCmS =
+      filteredCmS
+      + CIRCLE_SPEED_FILTER_ALPHA * (measuredCmS - filteredCmS);
+    return 0;
+  }
+
+  filteredCmS =
+    filteredCmS
+    + CIRCLE_SPEED_FILTER_ALPHA * (measuredCmS - filteredCmS);
+
+  float error = targetCmS - filteredCmS;
+  integral += error * dt;
+  integral =
+    constrain(
+      integral,
+      -CIRCLE_SPEED_INTEGRAL_LIMIT,
+      CIRCLE_SPEED_INTEGRAL_LIMIT
+    );
+
+  float correction =
+    CIRCLE_SPEED_KP * error
+    + CIRCLE_SPEED_KI * integral;
+
+  correction =
+    constrain(
+      correction,
+      -CIRCLE_PID_CORRECTION_LIMIT_PWM,
+      CIRCLE_PID_CORRECTION_LIMIT_PWM
+    );
+
+  float sign = targetCmS > 0.0f ? 1.0f : -1.0f;
+  float feedForward =
+    sign
+    * (
+      CIRCLE_MIN_PWM
+      + CIRCLE_PWM_PER_CM_S * fabs(targetCmS)
+    );
+
+  float rawPwm = feedForward + correction;
+
+  if (rawPwm * sign < CIRCLE_MIN_PWM) {
+    rawPwm = sign * CIRCLE_MIN_PWM;
+  }
+
+  rawPwm =
+    constrain(
+      rawPwm,
+      -CIRCLE_MAX_PWM,
+      CIRCLE_MAX_PWM
+    );
+
+  return (int)rawPwm;
+}
+
+void driveCircleWheelSpeeds(float leftTargetCmS, float rightTargetCmS) {
+  unsigned long now = millis();
+  float dt =
+    (lastCircleSpeedControlMs == 0)
+      ? 0.02f
+      : (now - lastCircleSpeedControlMs) / 1000.0f;
+
+  if (dt <= 0.0f || dt > 0.2f) {
+    dt = 0.02f;
+  }
+
+  lastCircleSpeedControlMs = now;
+  driveCorrectionHz = 1.0f / dt;
+
+  float maxTargetStep = CIRCLE_TARGET_ACCEL_CM_S2 * dt;
+
+  circleLeftCommandCmS =
+    approachValue(
+      circleLeftCommandCmS,
+      leftTargetCmS,
+      maxTargetStep
+    );
+  circleRightCommandCmS =
+    approachValue(
+      circleRightCommandCmS,
+      rightTargetCmS,
+      maxTargetStep
+    );
+
+  leftDriveTargetCmS = circleLeftCommandCmS;
+  rightDriveTargetCmS = circleRightCommandCmS;
+
+  int leftTargetPWM =
+    circleSpeedToPWM(
+      circleLeftCommandCmS,
+      leftWheelSpeedCmS,
+      circleLeftFilteredCmS,
+      circleLeftIntegral,
+      dt
+    );
+  int rightTargetPWM =
+    circleSpeedToPWM(
+      circleRightCommandCmS,
+      rightWheelSpeedCmS,
+      circleRightFilteredCmS,
+      circleRightIntegral,
+      dt
+    );
+
+  circleLeftPWM =
+    approachPWM(
+      circleLeftPWM,
+      leftTargetPWM,
+      CIRCLE_PWM_STEP_MAX
+    );
+  circleRightPWM =
+    approachPWM(
+      circleRightPWM,
+      rightTargetPWM,
+      CIRCLE_PWM_STEP_MAX
+    );
+
+  lastLeftCommandPWM = circleLeftPWM;
+  lastRightCommandPWM = circleRightPWM;
+
+  driveLeftMotor(circleLeftPWM);
+  driveRightMotor(circleRightPWM);
+}
+
+// ============================================================
+// PILOTAGE D'UNE LIGNE DROITE PAR LE STYLO
+// ============================================================
+
+void startDrawLine(float distanceCm, float directionDeg, unsigned long timeoutMs) {
+  updateImu();
+  updateOdometry();
+
+  lineStartXcm = penXcm;
+  lineStartYcm = penYcm;
+
+  lineTargetLengthCm = distanceCm;
+  lineDirectionRad = degToRad(directionDeg);
+
+  noInterrupts();
+  lineStartLeftTicks = encoderLeftTicks;
+  lineStartRightTicks = encoderRightTicks;
+  interrupts();
+
+  lineStartTime = millis();
+  lineTimeoutMs = timeoutMs;
+
+  resetPID(headingPID);
+  resetPID(distancePID);
+  resetWheelSpeedPID(leftSpeedPID);
+  resetWheelSpeedPID(rightSpeedPID);
+  resetMotionControlTiming();
+
+  activeMotion = MOTION_DRAW_LINE;
+  currentCommand = "AUTO_DRAW_LINE";
+
+  Serial.print("[LINE] Start line ");
+  Serial.print(distanceCm);
+  Serial.print(" cm at ");
+  Serial.print(directionDeg);
+  Serial.println(" deg");
+}
+
+bool updateDrawLine() {
+  float ux = cos(lineDirectionRad);
+  float uy = sin(lineDirectionRad);
+
+  float nx = -sin(lineDirectionRad);
+  float ny = cos(lineDirectionRad);
+
+  float dx = penXcm - lineStartXcm;
+  float dy = penYcm - lineStartYcm;
+
+  noInterrupts();
+  long leftNow = encoderLeftTicks;
+  long rightNow = encoderRightTicks;
+  interrupts();
+
+  float leftProgress = ticksToCm(leftNow - lineStartLeftTicks);
+  float rightProgress = ticksToCm(rightNow - lineStartRightTicks);
+  float progress = (leftProgress + rightProgress) / 2.0f;
+  float lateralError = dx * nx + dy * ny;
+  float remaining = lineTargetLengthCm - progress;
+
+  if (remaining <= VALEUR_FIN_DE_LIGNE) {
+    stopMotorsRaw();
+
+    Serial.print("[LINE] Done. Progress = ");
+    Serial.print(progress);
+    Serial.print(" cm | lateral error = ");
+    Serial.println(lateralError);
+
+    activeMotion = MOTION_NONE;
+    return true;
+  }
+
+  if (millis() - lineStartTime > lineTimeoutMs) {
+    stopMotorsRaw();
+
+    sequenceError = true;
+    sequenceActive = false;
+    activeMotion = MOTION_NONE;
+    sequenceStatus = "ERROR_LINE_TIMEOUT";
+    currentCommand = "ERROR";
+
+    Serial.println("[LINE] ERROR: line timeout");
+    return false;
+  }
+
+  // Correction latÃ©rale.
+  unsigned long now = millis();
+  float dt = (lastLineControlMs == 0) ? 0.02f : (now - lastLineControlMs) / 1000.0f;
+  if (dt <= 0.0f || dt > 0.2f) dt = 0.02f;
+  lastLineControlMs = now;
+  lineCorrectionHz = 1.0f / dt;
+
+  float lateralHeadingCorrection = -KP_LINE_LATERAL * lateralError;
+  lateralHeadingCorrection =
+    constrain(lateralHeadingCorrection, degToRad(-12.0f), degToRad(12.0f));
+
+  // Direction dÃ©sirÃ©e du stylo par rapport Ã  l'orientation actuelle du robot.
+  float targetHeading = normalizeAngleRad(lineDirectionRad + lateralHeadingCorrection);
+  float angleError = angleErrorRad(targetHeading, robotHeadingRad());
+
+  // Correction assez forte pour reprendre un vrai angle droit.
+  // 45Â° Ã©tait trop mou, 70Â° est le bon compromis.
+  angleError = constrain(angleError, degToRad(-70.0f), degToRad(70.0f));
+
+  float penSpeed = updatePID(distancePID, remaining, dt);
+  penSpeed = constrain(penSpeed, VITESSE_MIN_STYLO, VITESSE_STYLO);
+
+  if (remaining < 4.0f) {
+    penSpeed = VITESSE_MIN_STYLO;
+  }
+
+  float absAngleErrorDeg = fabs(radToDeg(angleError));
+  if (absAngleErrorDeg > LINE_SLOW_HEADING_ERROR_DEG) {
+    float speedScale =
+      1.0f
+      - (absAngleErrorDeg - LINE_SLOW_HEADING_ERROR_DEG)
+        / (LINE_TURN_IN_PLACE_ERROR_DEG - LINE_SLOW_HEADING_ERROR_DEG);
+
+    speedScale = constrain(speedScale, 0.0f, 1.0f);
+    penSpeed *= speedScale;
+  }
+
+  // CinÃ©matique inverse du point stylo.
+  float vRobot = penSpeed;
+  float omegaRobot = updatePID(headingPID, angleError, dt);
+
+  float leftWheelCmS = vRobot - omegaRobot * ECART_ROUES / 2.0f;
+  float rightWheelCmS = vRobot + omegaRobot * ECART_ROUES / 2.0f;
+
+  driveWheelSpeeds(leftWheelCmS, rightWheelCmS);
+
+  return false;
+}
+
+
+// ============================================================
+// ROTATION AU GYROSCOPE
+// ============================================================
+
+void startTurnAngle(float deltaDeg, unsigned long timeoutMs) {
+  updateImu();
+
+  turnTargetHeadingRad =
+    normalizeAngleRad(robotHeadingRad() + degToRad(deltaDeg));
+
+  turnStartTime = millis();
+  turnTimeoutMs = timeoutMs;
+
+  resetPID(turnPID);
+  resetWheelSpeedPID(leftSpeedPID);
+  resetWheelSpeedPID(rightSpeedPID);
+  resetMotionControlTiming();
+
+  activeMotion = MOTION_TURN_ANGLE;
+  currentCommand = "AUTO_TURN_GYRO";
+
+  Serial.print("[TURN] Start delta = ");
+  Serial.print(deltaDeg);
+  Serial.print(" deg | target = ");
+  Serial.println(radToDeg(turnTargetHeadingRad));
+}
+
+bool updateTurnAngle() {
+  unsigned long now = millis();
+  float dt = (lastTurnControlMs == 0) ? 0.02f : (now - lastTurnControlMs) / 1000.0f;
+  if (dt <= 0.0f || dt > 0.2f) dt = 0.02f;
+  lastTurnControlMs = now;
+  turnCorrectionHz = 1.0f / dt;
+
+  float error = angleErrorRad(turnTargetHeadingRad, robotHeadingRad());
+
+  if (fabs(error) <= degToRad(2.0f)) {
+    stopMotorsRaw();
+
+    activeMotion = MOTION_NONE;
+
+    Serial.print("[TURN] Done. Error = ");
+    Serial.print(radToDeg(error), 2);
+    Serial.println(" deg");
+
+    return true;
+  }
+
+  if (millis() - turnStartTime > turnTimeoutMs) {
+    stopMotorsRaw();
+
+    sequenceError = true;
+    sequenceActive = false;
+    activeMotion = MOTION_NONE;
+    sequenceStatus = "ERROR_TURN_TIMEOUT";
+    currentCommand = "ERROR";
+
+    Serial.println("[TURN] ERROR: turn timeout");
+    return false;
+  }
+
+  float omegaRobot = updatePID(turnPID, error, dt);
+
+  if (fabs(omegaRobot) < 0.65f) {
+    omegaRobot = (omegaRobot < 0.0f) ? -0.65f : 0.65f;
+  }
+
+  float leftWheelCmS = -omegaRobot * ECART_ROUES / 2.0f;
+  float rightWheelCmS = omegaRobot * ECART_ROUES / 2.0f;
+
+  driveWheelSpeeds(leftWheelCmS, rightWheelCmS);
+
+  return false;
+}
+
+
+// ============================================================
+// PILOTAGE D'UN CERCLE PAR LE STYLO
+// ============================================================
+
+void startDrawCircle(float radiusCm, int turns, unsigned long timeoutMs) {
+
+  if (radiusCm < CIRCLE_MIN_RADIUS_CM || radiusCm > CIRCLE_MAX_RADIUS_CM) {
+    stopMotorsRaw();
+
+    sequenceError = true;
+    sequenceActive = false;
+    activeMotion = MOTION_NONE;
+    sequenceStatus = "ERROR_CIRCLE_RADIUS";
+    currentCommand = "ERROR";
+
+    Serial.print("[CIRCLE] ERROR radius out of range: ");
+    Serial.println(radiusCm);
+    return;
+  }
+
+  updateImu();
+  updateOdometry();
+  updatePenPosition();
+
+  circleStartPenXcm = penXcm;
+  circleStartPenYcm = penYcm;
+  circleProgressDeg = 0.0f;
+  circleClosureErrorCm = 0.0f;
+
+  circleRadiusCm = radiusCm;
+  circleTurnDirection = (turns >= 0) ? 1.0f : -1.0f;
+  int absTurns = abs(turns);
+  if (absTurns == 0) absTurns = 1;
+
+  float radiusSquared =
+    circleRadiusCm * circleRadiusCm
+    - ECART_STYLO * ECART_STYLO;
+
+  if (radiusSquared < 0.0f) radiusSquared = 0.0f;
+
+  circleRobotRadiusCm = sqrt(radiusSquared);
+
+  float halfTrack = ECART_ROUES_CERCLE / 2.0f;
+  circleInnerWheelRadiusCm = circleRobotRadiusCm - halfTrack;
+  circleOuterWheelRadiusCm = circleRobotRadiusCm + halfTrack;
+
+  float omegaAbs = 0.0f;
+
+  if (fabs(circleInnerWheelRadiusCm) < 0.20f) {
+    omegaAbs = CIRCLE_MAX_WHEEL_CM_S / circleOuterWheelRadiusCm;
+  } else {
+    float innerWheelTarget = CIRCLE_MIN_MOVING_WHEEL_CM_S;
+
+    omegaAbs =
+      innerWheelTarget / fabs(circleInnerWheelRadiusCm);
+
+    float outerWheelSpeed =
+      omegaAbs * circleOuterWheelRadiusCm;
+
+    if (outerWheelSpeed > CIRCLE_MAX_WHEEL_CM_S) {
+      omegaAbs = CIRCLE_MAX_WHEEL_CM_S / circleOuterWheelRadiusCm;
+    }
+  }
+
+  float vRobot = omegaAbs * circleRobotRadiusCm;
+  float omegaRobot = circleTurnDirection * omegaAbs;
+
+  circleLeftTargetCmS =
+    vRobot - omegaRobot * halfTrack;
+  circleRightTargetCmS =
+    vRobot + omegaRobot * halfTrack;
+
+  bool leftWheelIsInner = circleTurnDirection > 0.0f;
+
+  if (leftWheelIsInner) {
+    circleLeftTargetCmS *= CIRCLE_INNER_TARGET_SCALE;
+  } else {
+    circleRightTargetCmS *= CIRCLE_INNER_TARGET_SCALE;
+  }
+
+  circleLeftCommandCmS = 0.0f;
+  circleRightCommandCmS = 0.0f;
+  circleAdaptiveScale = 1.0f;
+
+  float heading = robotHeadingRad();
+  float leftNormalX = -sin(heading);
+  float leftNormalY = cos(heading);
+
+  // Centre instantane de rotation de l'axe des roues.
+  circleCenterXcm =
+    robotXcm + circleTurnDirection * circleRobotRadiusCm * leftNormalX;
+  circleCenterYcm =
+    robotYcm + circleTurnDirection * circleRobotRadiusCm * leftNormalY;
+
+  circleStartAngleRad =
+    atan2(
+      penYcm - circleCenterYcm,
+      penXcm - circleCenterXcm
+    );
+
+  circleTargetAngleRad =
+    circleStartAngleRad + circleTurnDirection * 2.0f * PI * absTurns;
+
+  accumulatedCircleAngle = 0.0f;
+  lastCircleAngle = circleStartAngleRad;
+
+  circleStartTime = millis();
+  circleTimeoutMs = timeoutMs;
+
+  resetCircleSpeedController();
+  resetMotionControlTiming();
+
+  activeMotion = MOTION_DRAW_CIRCLE;
+  currentCommand = "AUTO_DRAW_CIRCLE";
+
+  Serial.print("[CIRCLE] Start pen radius = ");
+  Serial.print(circleRadiusCm);
+  Serial.print(" cm | robot radius = ");
+  Serial.print(circleRobotRadiusCm);
+  Serial.print(" cm | inner/outer radius = ");
+  Serial.print(circleInnerWheelRadiusCm);
+  Serial.print("/");
+  Serial.print(circleOuterWheelRadiusCm);
+  Serial.print(" cm | track = ");
+  Serial.print(ECART_ROUES_CERCLE);
+  Serial.print(" cm | left/right = ");
+  Serial.print(circleLeftTargetCmS);
+  Serial.print("/");
+  Serial.print(circleRightTargetCmS);
+  Serial.print(" cm/s | turns = ");
+  Serial.println(turns);
+}
+
+
+bool updateDrawCircle() {
+
+  float dx = penXcm - circleCenterXcm;
+  float dy = penYcm - circleCenterYcm;
+
+  float angleNow = atan2(dy, dx);
+
+  float deltaAngle =
+    normalizeAngleRad(angleNow - lastCircleAngle);
+
+  float signedDeltaAngle = deltaAngle * circleTurnDirection;
+
+  if (signedDeltaAngle < 0.0f) {
+    signedDeltaAngle = 0.0f;
+  }
+
+  signedDeltaAngle =
+    constrain(
+      signedDeltaAngle,
+      0.0f,
+      degToRad(CIRCLE_MAX_DELTA_DEG)
+    );
+
+  accumulatedCircleAngle += circleTurnDirection * signedDeltaAngle;
+
+  lastCircleAngle = angleNow;
+
+  float targetAngleAbs =
+    fabs(circleTargetAngleRad - circleStartAngleRad);
+
