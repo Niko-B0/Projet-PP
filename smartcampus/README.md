@@ -13,81 +13,64 @@ SmartCampus est une application web pédagogique pour la gestion académique d�
 ## Prérequis
 - PHP 8+
 - MySQL
-- Node.js 18+
-- npm
 - Un serveur MySQL local : MAMP, XAMPP, WAMP, Laragon ou MySQL installé séparément
+- Node.js et npm seulement si vous souhaitez modifier puis recompiler le frontend React
 
-## Installation
-1. Ouvrir un terminal.
-2. Aller dans le dossier du projet :
-```bash
-cd smartcampus
+## Installation et lancement sous Windows
+
+### 1. Démarrer le serveur local
+Lancez MAMP, XAMPP, WAMP ou Laragon, puis démarrez MySQL.
+
+### 2. Créer la base de données
+Ouvrez phpMyAdmin depuis votre serveur local.
+
+Créez une nouvelle base de données nommée :
+
+```text
+smartcampus
 ```
 
-### Base de données
-1. Créez une base de données `smartcampus` dans MySQL.
-2. Importez le fichier SQL :
-```bash
-mysql -u root -p smartcampus < database/schema.sql
-```
-3. Exécutez le script de données de test :
-```bash
-php database/seed.php
+### 3. Importer les tables
+Dans phpMyAdmin, sélectionnez la base `smartcampus`.
+
+Allez dans l'onglet **Importer**, puis choisissez le fichier :
+
+```text
+database/schema.sql
 ```
 
-Sous Windows, vous pouvez aussi double-cliquer sur `database\seed.bat`.
-Ce script cherche automatiquement PHP dans le PATH, MAMP, XAMPP, WAMP ou Laragon.
+Validez l'import.
 
-> Si votre installation MySQL utilise d’autres identifiants, adaptez `DB_USER` et `DB_PASS`.
+### 4. Ajouter les données de test
+Dans l'explorateur Windows, ouvrez le dossier du projet `smartcampus`.
 
-### Lancer le backend
-```bash
-php -S localhost:8000 -t backend/public
+Double-cliquez sur le fichier :
+
+```text
+database/seed.bat
 ```
 
-Si votre base MySQL n’utilise pas les identifiants par défaut, définissez les variables d’environnement avant de lancer le backend :
+Ce script remplit la base avec les comptes de test, les cours, les inscriptions, les notes, les présences et les créneaux.
 
-PowerShell :
-```powershell
-$env:DB_HOST = '127.0.0.1'
-$env:DB_NAME = 'smartcampus'
-$env:DB_USER = 'root'
-$env:DB_PASS = 'votre_mot_de_passe'
-php -S localhost:8000 -t backend/public
+### 5. Lancer le site
+Dans le dossier `smartcampus`, double-cliquez sur :
+
+```text
+start.bat
 ```
 
-Invite de commandes Windows :
-```cmd
-set DB_HOST=127.0.0.1
-set DB_NAME=smartcampus
-set DB_USER=root
-set DB_PASS=votre_mot_de_passe
-php -S localhost:8000 -t backend\public
+Le site s'ouvre ensuite dans le navigateur à l'adresse :
+
+```text
+http://localhost:8000
 ```
 
-### Lancer le frontend
-```bash
-cd frontend
-npm install
-npm run dev
-```
+Gardez la fenêtre noire ouverte pendant l'utilisation du site.
 
-### Lancement simple sous Windows
-Pour une démonstration locale sans lancer deux serveurs :
+### Remarque pour les développeurs
+Le dossier `frontend/dist` est déjà fourni, donc Node.js n'est pas nécessaire pour simplement lancer le site.
 
-1. Démarrez MySQL dans MAMP, XAMPP, WAMP ou Laragon.
-2. Créez la base `smartcampus` et importez `database/schema.sql`.
-3. Double-cliquez sur `database\seed.bat` pour ajouter les données de test.
-4. Compilez le frontend une première fois :
-```bash
-cd frontend
-npm install
-npm run build
-```
-5. Revenez dans le dossier `smartcampus`, puis double-cliquez sur `start.bat`.
-6. Le site est accessible sur `http://localhost:8000`.
-
-`start.bat` cherche automatiquement PHP dans le PATH, MAMP, XAMPP, WAMP ou Laragon. Il sert le frontend compilé et l'API PHP avec le même serveur local.
+Si vous modifiez le code React dans `frontend/src`, il faut alors recompiler le frontend avec npm avant de relancer `start.bat`.
 
 ## Comptes de test
 - admin@smartcampus.local / password123
