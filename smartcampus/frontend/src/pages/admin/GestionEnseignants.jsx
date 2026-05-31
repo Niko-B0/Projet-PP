@@ -16,6 +16,7 @@ function GestionEnseignants() {
   const [error, setError] = useState(null)
   const [success, setSuccess] = useState(null)
   const [creating, setCreating] = useState(false)
+  const [deletingId, setDeletingId] = useState(null)
   const [form, setForm] = useState(emptyForm)
 
   const loadTeachers = () => {
@@ -47,6 +48,25 @@ function GestionEnseignants() {
       setError(err.message)
     } finally {
       setCreating(false)
+    }
+  }
+
+  const handleDelete = async (teacher) => {
+    const confirmed = window.confirm(`Supprimer l'enseignant ${teacher.prenom} ${teacher.nom} ?`)
+    if (!confirmed) {
+      return
+    }
+    setError(null)
+    setSuccess(null)
+    setDeletingId(teacher.id_teacher)
+    try {
+      await api.delete(`/teachers/${teacher.id_teacher}`)
+      setSuccess('Enseignant supprime avec succes.')
+      loadTeachers()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -104,6 +124,7 @@ function GestionEnseignants() {
               <th>Email</th>
               <th>Matiere</th>
               <th>Nombre de cours</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
@@ -113,6 +134,16 @@ function GestionEnseignants() {
                 <td>{teacher.email}</td>
                 <td>{teacher.matiere}</td>
                 <td>{teacher.courseCount}</td>
+                <td>
+                  <button
+                    className="secondary"
+                    type="button"
+                    disabled={deletingId === teacher.id_teacher}
+                    onClick={() => handleDelete(teacher)}
+                  >
+                    {deletingId === teacher.id_teacher ? 'Suppression...' : 'Supprimer'}
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>

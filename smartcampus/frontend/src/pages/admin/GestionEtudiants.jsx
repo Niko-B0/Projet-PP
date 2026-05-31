@@ -23,6 +23,7 @@ function GestionEtudiants() {
   const [error, setError] = useState(null)
   const [success, setSuccess] = useState(null)
   const [creating, setCreating] = useState(false)
+  const [deletingId, setDeletingId] = useState(null)
   const [form, setForm] = useState(emptyForm)
 
   const loadStudents = () => {
@@ -57,6 +58,25 @@ function GestionEtudiants() {
       setError(err.message)
     } finally {
       setCreating(false)
+    }
+  }
+
+  const handleDelete = async (student) => {
+    const confirmed = window.confirm(`Supprimer l'etudiant ${student.prenom} ${student.nom} ?`)
+    if (!confirmed) {
+      return
+    }
+    setError(null)
+    setSuccess(null)
+    setDeletingId(student.id_student)
+    try {
+      await api.delete(`/students/${student.id_student}`)
+      setSuccess('Etudiant supprime avec succes.')
+      loadStudents()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -157,9 +177,19 @@ function GestionEtudiants() {
                 <td>{student.niveau}</td>
                 <td>{student.specialite}</td>
                 <td>
-                  <Link to={`/admin/students/${student.id_student}`} className="secondary">
-                    Voir fiche
-                  </Link>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <Link to={`/admin/students/${student.id_student}`} className="secondary">
+                      Voir fiche
+                    </Link>
+                    <button
+                      className="secondary"
+                      type="button"
+                      disabled={deletingId === student.id_student}
+                      onClick={() => handleDelete(student)}
+                    >
+                      {deletingId === student.id_student ? 'Suppression...' : 'Supprimer'}
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
