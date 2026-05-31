@@ -84,7 +84,7 @@ class CoursController {
                 sendError('Acces interdit', 403);
             }
         }
-        $stmt = $pdo->prepare('SELECT e.id_enrollment AS enrollment_id, s.id_student, u.nom, u.prenom, u.email, u.telephone FROM enrollments e JOIN students s ON e.id_student = s.id_student JOIN users u ON s.id_user = u.id_user WHERE e.id_course = :id_course');
+        $stmt = $pdo->prepare('SELECT e.id_enrollment AS enrollment_id, s.id_student, u.nom, u.prenom, u.email, u.telephone, g.id_grade, g.valeur, g.coef, g.type_evaluation, g.locked FROM enrollments e JOIN students s ON e.id_student = s.id_student JOIN users u ON s.id_user = u.id_user LEFT JOIN grades g ON g.id_enrollment = e.id_enrollment WHERE e.id_course = :id_course');
         $stmt->execute(['id_course' => $id]);
         sendSuccess($stmt->fetchAll());
     }

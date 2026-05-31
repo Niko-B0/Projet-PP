@@ -197,6 +197,14 @@ if ($method === 'PUT' && preg_match('#^/api/grades/([0-9]+)$#', $path, $matches)
     NoteController::update($matches[1]);
 }
 
+if ($method === 'POST' && preg_match('#^/api/grades/([0-9]+)/lock$#', $path, $matches)) {
+    NoteController::lock($matches[1]);
+}
+
+if ($method === 'DELETE' && preg_match('#^/api/grades/([0-9]+)$#', $path, $matches)) {
+    NoteController::delete($matches[1]);
+}
+
 if ($path === '/api/attendance' && $method === 'GET') {
     PresenceController::index();
 }

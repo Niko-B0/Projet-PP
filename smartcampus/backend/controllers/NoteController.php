@@ -15,8 +15,9 @@ class NoteController {
             sendError('id_enrollment et valeur sont requis', 400);
         }
         if ($input['valeur'] < 0 || $input['valeur'] > 20) {
-            sendError('La note doit être entre 0 et 20.', 400);
+            sendError('La note doit etre entre 0 et 20.', 400);
         }
+
         $pdo = getDatabaseConnection();
         $stmt = $pdo->prepare('SELECT c.id_teacher, c.id_course FROM courses c JOIN enrollments e ON e.id_course = c.id_course WHERE e.id_enrollment = :id_enrollment');
         $stmt->execute(['id_enrollment' => $input['id_enrollment']]);
@@ -24,16 +25,39 @@ class NoteController {
         if (!$row) {
             sendError('Inscription introuvable', 404);
         }
+
         $current = currentSessionUser();
         if ($current['role'] === 'teacher' && $current['id_teacher'] != $row['id_teacher']) {
             sendError('Vous ne pouvez noter que vos propres cours.', 403);
         }
+        if ($current['role'] !== 'teacher' && $current['role'] !== 'admin') {
+            sendError('Acces interdit', 403);
+        }
+
+        $typeEvaluation = $input['type_evaluation'] ?? 'Controle';
+        $stmt = $pdo->prepare('SELECT id_grade, locked FROM grades WHERE id_enrollment = :id_enrollment AND type_evaluation = :type_evaluation');
+        $stmt->execute(['id_enrollment' => $input['id_enrollment'], 'type_evaluation' => $typeEvaluation]);
+        $existingGrade = $stmt->fetch();
+        if ($existingGrade) {
+            if ($existingGrade['locked']) {
+                sendError('Note verrouillee, modification impossible.', 400);
+            }
+            $stmt = $pdo->prepare('UPDATE grades SET valeur = :valeur, coef = :coef, id_teacher = :id_teacher, date_note = CURDATE() WHERE id_grade = :id_grade');
+            $stmt->execute([
+                'valeur' => $input['valeur'],
+                'coef' => $input['coef'] ?? 1,
+                'id_teacher' => $current['id_teacher'] ?? $row['id_teacher'],
+                'id_grade' => $existingGrade['id_grade']
+            ]);
+            sendSuccess(['id_grade' => $existingGrade['id_grade']]);
+        }
+
         $stmt = $pdo->prepare('INSERT INTO grades (id_enrollment, id_teacher, valeur, type_evaluation, coef, date_note) VALUES (:id_enrollment, :id_teacher, :valeur, :type_evaluation, :coef, CURDATE())');
         $stmt->execute([
             'id_enrollment' => $input['id_enrollment'],
             'id_teacher' => $current['id_teacher'] ?? $row['id_teacher'],
             'valeur' => $input['valeur'],
-            'type_evaluation' => $input['type_evaluation'] ?? 'Contrôle',
+            'type_evaluation' => $typeEvaluation,
             'coef' => $input['coef'] ?? 1
         ]);
         sendSuccess(['id_grade' => $pdo->lastInsertId()]);
@@ -46,8 +70,9 @@ class NoteController {
             sendError('Valeur est requise', 400);
         }
         if ($input['valeur'] < 0 || $input['valeur'] > 20) {
-            sendError('La note doit être entre 0 et 20.', 400);
+            sendError('La note doit etre entre 0 et 20.', 400);
         }
+
         $pdo = getDatabaseConnection();
         $stmt = $pdo->prepare('SELECT g.locked, c.id_teacher FROM grades g JOIN enrollments e ON g.id_enrollment = e.id_enrollment JOIN courses c ON e.id_course = c.id_course WHERE g.id_grade = :id_grade');
         $stmt->execute(['id_grade' => $id]);
@@ -56,19 +81,73 @@ class NoteController {
             sendError('Note introuvable', 404);
         }
         if ($grade['locked']) {
-            sendError('Note verrouillée, modification impossible.', 400);
+            sendError('Note verrouillee, modification impossible.', 400);
         }
+
         $current = currentSessionUser();
         if ($current['role'] === 'teacher' && $current['id_teacher'] != $grade['id_teacher']) {
             sendError('Vous ne pouvez modifier que vos propres notes.', 403);
         }
+        if ($current['role'] !== 'teacher' && $current['role'] !== 'admin') {
+            sendError('Acces interdit', 403);
+        }
+
         $stmt = $pdo->prepare('UPDATE grades SET valeur = :valeur, type_evaluation = :type_evaluation, coef = :coef WHERE id_grade = :id_grade');
         $stmt->execute([
             'valeur' => $input['valeur'],
-            'type_evaluation' => $input['type_evaluation'] ?? 'Contrôle',
+            'type_evaluation' => $input['type_evaluation'] ?? 'Controle',
             'coef' => $input['coef'] ?? 1,
             'id_grade' => $id
         ]);
         sendSuccess(['id_grade' => $id]);
+    }
+
+    public static function lock($id) {
+        requireAuthentication();
+        $pdo = getDatabaseConnection();
+        $stmt = $pdo->prepare('SELECT c.id_teacher FROM grades g JOIN enrollments e ON g.id_enrollment = e.id_enrollment JOIN courses c ON e.id_course = c.id_course WHERE g.id_grade = :id_grade');
+        $stmt->execute(['id_grade' => $id]);
+        $grade = $stmt->fetch();
+        if (!$grade) {
+            sendError('Note introuvable', 404);
+        }
+
+        $current = currentSessionUser();
+        if ($current['role'] === 'teacher' && $current['id_teacher'] != $grade['id_teacher']) {
+            sendError('Vous ne pouvez verrouiller que vos propres notes.', 403);
+        }
+        if ($current['role'] !== 'teacher' && $current['role'] !== 'admin') {
+            sendError('Acces interdit', 403);
+        }
+
+        $stmt = $pdo->prepare('UPDATE grades SET locked = TRUE WHERE id_grade = :id_grade');
+        $stmt->execute(['id_grade' => $id]);
+        sendSuccess(['id_grade' => $id, 'locked' => true]);
+    }
+
+    public static function delete($id) {
+        requireAuthentication();
+        $pdo = getDatabaseConnection();
+        $stmt = $pdo->prepare('SELECT g.locked, c.id_teacher FROM grades g JOIN enrollments e ON g.id_enrollment = e.id_enrollment JOIN courses c ON e.id_course = c.id_course WHERE g.id_grade = :id_grade');
+        $stmt->execute(['id_grade' => $id]);
+        $grade = $stmt->fetch();
+        if (!$grade) {
+            sendError('Note introuvable', 404);
+        }
+        if ($grade['locked']) {
+            sendError('Note verrouillee, suppression impossible.', 400);
+        }
+
+        $current = currentSessionUser();
+        if ($current['role'] === 'teacher' && $current['id_teacher'] != $grade['id_teacher']) {
+            sendError('Vous ne pouvez supprimer que vos propres notes.', 403);
+        }
+        if ($current['role'] !== 'teacher' && $current['role'] !== 'admin') {
+            sendError('Acces interdit', 403);
+        }
+
+        $stmt = $pdo->prepare('DELETE FROM grades WHERE id_grade = :id_grade');
+        $stmt->execute(['id_grade' => $id]);
+        sendSuccess(['message' => 'Note supprimee']);
     }
 }
