@@ -167,7 +167,7 @@ class EtudiantController {
         }
 
         $pdo = getDatabaseConnection();
-        $stmt = $pdo->prepare('SELECT g.id_grade, c.nom_cours, g.valeur, g.coef, g.type_evaluation, (SELECT AVG(valeur) FROM grades WHERE id_enrollment = g.id_enrollment) AS course_average FROM grades g JOIN enrollments e ON g.id_enrollment = e.id_enrollment JOIN courses c ON e.id_course = c.id_course WHERE e.id_student = :id_student');
+        $stmt = $pdo->prepare('SELECT COALESCE(g.id_grade, e.id_enrollment) AS id_grade, c.nom_cours, g.valeur, COALESCE(g.coef, c.coefficient) AS coef, g.type_evaluation, (SELECT AVG(valeur) FROM grades WHERE id_enrollment = e.id_enrollment) AS course_average FROM enrollments e JOIN courses c ON e.id_course = c.id_course LEFT JOIN grades g ON g.id_enrollment = e.id_enrollment WHERE e.id_student = :id_student AND e.statut = "active" ORDER BY c.nom_cours');
         $stmt->execute(['id_student' => $id]);
         sendSuccess($stmt->fetchAll());
     }
